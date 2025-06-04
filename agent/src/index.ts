@@ -31,6 +31,7 @@ import { fileURLToPath } from "url";
 import yargs from "yargs";
 import Database from "better-sqlite3";
 import { SqliteDatabaseAdapter } from "@elizaos/adapter-sqlite";
+import { Database as TwitterDatabase } from "./database";
 
 const __filename = fileURLToPath(import.meta.url); // get the resolved path to the file
 const __dirname = path.dirname(__filename); // get the name of the directory
@@ -665,7 +666,10 @@ export async function createAgent(
     const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
 
     // Use runtimeWithRag for TwitterIntegration
-    const twitterIntegration = new TwitterIntegration(runtimeWithRag);
+    const db = new TwitterDatabase();
+    await db.initialize();
+    const twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
+    await twitterIntegration.initialize();
 
     return runtime;
 }
@@ -779,7 +783,9 @@ async function initializeTwitter(runtime: AgentRuntime) {
             }
         };
         const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-        const twitterIntegration = new TwitterIntegration(runtimeWithRag);
+        const db = new TwitterDatabase();
+        await db.initialize();
+        const twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
         await twitterIntegration.initialize();
         
         if (!twitterIntegration.initialized) {
@@ -844,7 +850,9 @@ async function startAgent(
                     }
                 };
                 const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-                twitterIntegration = new TwitterIntegration(runtimeWithRag);
+                const db = new TwitterDatabase();
+                await db.initialize();
+                twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
                 await twitterIntegration.initialize();
                 
                 // Add Twitter integration to runtime for persistence
@@ -997,7 +1005,9 @@ const startAgents = async () => {
                     }
                 };
                 const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-                twitterIntegration = new TwitterIntegration(runtimeWithRag);
+                const db = new TwitterDatabase();
+                await db.initialize();
+                twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
                 await twitterIntegration.initialize();
                 
                 // Add Twitter integration to runtime for persistence

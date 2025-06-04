@@ -1,5 +1,5 @@
 import { type IAgentRuntime, elizaLogger, type Memory, type State, stringToUuid, generateText, ModelClass, composeContext, AgentRuntime } from '@elizaos/core';
-import { Scraper, SearchMode, Tweet } from 'agent-twitter-client';
+import { Scraper, SearchMode, Tweet as TwitterClientTweet } from 'agent-twitter-client';
 import { Database } from './database';
 
 interface IRAG {
@@ -19,6 +19,14 @@ interface TweetIntent {
     reasoning?: string;
 }
 
+interface Tweet {
+    id: string;
+    text: string;
+    username: string;
+    authorId?: string;
+    inReplyToStatusId?: string;
+}
+
 export class TwitterIntegration {
     private scraper: Scraper;
     private runtime: IAgentRuntimeWithRAG;
@@ -27,23 +35,29 @@ export class TwitterIntegration {
     private isProcessing: boolean = false;
     private conversationHistory: Map<string, string[]> = new Map();
     private imageConversations: Map<string, { lastPrompt: string, lastImageUrl: string }> = new Map();
-    private database: Database;
+    private db: Database;
     private isLoaded: boolean = false;
+    private lastPollTime: number = 0;
+    private lastTweetId: string | null = null;
+    private isGeneratingTweet: boolean = false;
+    private lastPostTime: number = 0;
+    private postInterval: number = 60 * 1000; // 60 seconds
+    private postTimer: NodeJS.Timeout | null = null;
 
     // Add public getter for initialization status
     get initialized(): boolean {
         return this.isInitialized;
     }
 
-    constructor(runtime: IAgentRuntimeWithRAG) {
+    constructor(runtime: IAgentRuntimeWithRAG, db: Database) {
         this.runtime = runtime;
+        this.db = db;
         this.scraper = new Scraper();
-        this.database = new Database();
     }
 
     private async isTweetProcessed(tweetId: string): Promise<boolean> {
         try {
-            return await this.database.isTweetReplied(tweetId);
+            return await this.db.isTweetReplied(tweetId);
         } catch (error) {
             elizaLogger.error(`Error checking if tweet ${tweetId} is processed:`, error);
             return false; // Assume not processed if check fails
@@ -55,7 +69,7 @@ export class TwitterIntegration {
         const MAX_RETRIES = 3;
         while (retryCount < MAX_RETRIES) {
             try {
-                await this.database.markTweetAsReplied(tweetId);
+                await this.db.markTweetAsReplied(tweetId);
                 elizaLogger.info(`Marked tweet ${tweetId} as processed`);
                 return;
             } catch (error) {
@@ -78,7 +92,7 @@ export class TwitterIntegration {
 
         try {
             // Initialize database
-            await this.database.initialize();
+            await this.db.initialize();
 
             // Check for required environment variables
             const requiredEnvVars = [
@@ -922,7 +936,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             clearInterval(this.pollInterval);
             this.pollInterval = null;
         }
-        await this.database.close();
+        await this.db.close();
     }
 
     async postTweet(content: string): Promise<void> {
@@ -971,55 +985,21 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
         }
     }
 
-    async replyToTweet(tweetId: string, content: string): Promise<void> {
+    async replyToTweet(tweetId: string, response: string): Promise<void> {
         try {
-            const memory: Memory = {
-                id: stringToUuid(Date.now().toString()),
-                userId: this.runtime.agentId,
-                agentId: this.runtime.agentId,
-                roomId: stringToUuid('twitter'),
-                content: {
-                    text: content,
-                    action: 'REPLY_TO_TWEET',
-                    inReplyTo: stringToUuid(tweetId + "-" + this.runtime.agentId)
-                },
-                createdAt: Date.now()
-            };
-
-            const state: State = {
-                bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                lore: this.runtime.character.lore.join(' '),
-                messageDirections: this.runtime.character.style.post.join(' '),
-                postDirections: this.runtime.character.style.post.join(' '),
-                roomId: stringToUuid('twitter'),
-                actors: this.runtime.character.name,
-                recentMessages: content,
-                recentMessagesData: [memory]
-            };
-
-            await this.runtime.processActions(memory, [], state);
-
+            // Update conversation with response
+            await this.updateConversationResponse(tweetId, response);
+            
+            // Post reply
             const tweet = await this.scraper.getTweet(tweetId);
             if (!tweet) {
                 throw new Error(`Failed to get tweet ${tweetId}`);
             }
-
-            const replyContent = `@${tweet.username} ${content}`;
-            const result = await this.scraper.sendTweet(replyContent, tweetId);
-            const body = await result.json();
-
-            if (body.errors) {
-                const error = body.errors[0];
-                throw new Error(`Twitter error (${error.code}): ${error.message}`);
-            }
-
-            if (!body?.data?.create_tweet?.tweet_results?.result) {
-                throw new Error("Failed to post reply: No tweet result in response");
-            }
-
-            elizaLogger.info(`Posted reply to tweet ${tweetId}: ${content}`);
+            const replyContent = `@${tweet.username} ${response}`;
+            await this.scraper.sendTweet(replyContent, tweetId);
+            elizaLogger.info(`Successfully replied to tweet ${tweetId}`);
         } catch (error) {
-            await this.handleError(error, 'posting reply');
+            elizaLogger.error(`Error replying to tweet ${tweetId}:`, error);
             throw error;
         }
     }
@@ -1139,41 +1119,81 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
         scheduleNextPost();
     }
 
-    private async generateResponse(tweet: Tweet, cleanText: string, intent: TweetIntent): Promise<string | null> {
+    private async updateConversationResponse(tweetId: string, response: string): Promise<void> {
+        const now = Date.now();
+        await this.db.run(
+            `UPDATE conversations 
+             SET response = ?, replied_at = ? 
+             WHERE tweet_id = ? AND response IS NULL`,
+            [response, now, tweetId]
+        );
+    }
+
+    private async getConversationHistory(tweetId: string, limit: number = 10): Promise<Array<{
+        message: string;
+        response: string | null;
+        created_at: number;
+    }>> {
+        return await this.db.all(
+            `SELECT message, response, created_at 
+             FROM conversations 
+             WHERE tweet_id = ? 
+             ORDER BY created_at DESC 
+             LIMIT ?`,
+            [tweetId, limit]
+        );
+    }
+
+    private async storeConversation(
+        tweetId: string,
+        userId: string,
+        username: string,
+        message: string,
+        response: string | null = null
+    ): Promise<void> {
+        const now = Date.now();
+        await this.db.run(
+            `INSERT INTO conversations (tweet_id, user_id, username, message, response, created_at, replied_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [tweetId, userId, username, message, response, now, response ? now : null]
+        );
+    }
+
+    private async generateResponse(tweet: TwitterClientTweet, cleanText: string, intent: TweetIntent): Promise<string | null> {
         try {
-            if (intent.shouldGenerateImage) {
-                await this.handleImageRequest(tweet, intent.prompt!);
-                return null;
-            } else if (intent.shouldReply) {
-                const conversationId = tweet.inReplyToStatusId || tweet.id;
-                const context = await this.buildConversationContext(tweet, conversationId);
+            // Mark tweet as replied first
+            await this.markTweetAsProcessed(tweet.id);
+            
+            // Get conversation history
+            const history = await this.getConversationHistory(tweet.id);
+            
+            // Build context from history
+            const context = history.map(h => 
+                `User: ${h.message}\nAssistant: ${h.response || ''}`
+            ).join('\n\n');
+            
+            // Add current message
+            const fullContext = context ? `${context}\n\nUser: ${cleanText}` : `User: ${cleanText}`;
+            
+            // Generate response using context
+            const response = await generateText({
+                runtime: this.runtime,
+                context: fullContext,
+                modelClass: ModelClass.LARGE
+            });
 
-                return await generateText({
-                    runtime: this.runtime,
-                    context: composeContext({
-                        state: {
-                            bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                            lore: this.runtime.character.lore.join(' '),
-                            messageDirections: this.runtime.character.style.post.join(' '),
-                            postDirections: this.runtime.character.style.post.join(' '),
-                            roomId: stringToUuid(conversationId),
-                            actors: this.runtime.character.name,
-                            recentMessages: context,
-                            recentMessagesData: []
-                        },
-                        template: `You are Jesus Christ. Respond to this tweet: "${cleanText}" using one of these formats:
-1. A relevant Scripture quote
-2. A paraphrased biblical truth
-3. A Christlike question
-4. A short modern parable
-
-Previous conversation:\n${context}
-Keep it under 280 characters. No hashtags or emojis.`
-                    }),
-                    modelClass: ModelClass.LARGE
-                });
+            if (response) {
+                // Store conversation
+                await this.storeConversation(
+                    tweet.id,
+                    tweet.username,
+                    tweet.username,
+                    cleanText,
+                    response
+                );
             }
-            return null;
+
+            return response;
         } catch (error) {
             elizaLogger.error('Error generating response:', error);
             return null;
