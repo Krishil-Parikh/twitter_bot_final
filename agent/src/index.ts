@@ -800,7 +800,26 @@ export async function createAgent(
                         throw new Error('Invalid embedding array received');
                     }
 
-                    const embedding = new Float32Array(embeddingArray);
+                    // Convert to Float32Array and ensure 384 dimensions
+                    let embedding = new Float32Array(embeddingArray);
+                    if (embedding.length !== 384) {
+                        elizaLogger.warn(`[RAG] Converting embedding from ${embedding.length} to 384 dimensions`);
+                        const reducedEmbedding = new Float32Array(384);
+                        const chunkSize = Math.floor(embedding.length / 384);
+                        for (let i = 0; i < 384; i++) {
+                            let sum = 0;
+                            for (let j = 0; j < chunkSize; j++) {
+                                sum += embedding[i * chunkSize + j] || 0;
+                            }
+                            reducedEmbedding[i] = sum / chunkSize;
+                        }
+                        // Normalize the reduced embedding
+                        const magnitude = Math.sqrt(reducedEmbedding.reduce((sum, val) => sum + val * val, 0));
+                        for (let i = 0; i < 384; i++) {
+                            reducedEmbedding[i] /= magnitude;
+                        }
+                        embedding = reducedEmbedding;
+                    }
                     
                     // Cache in memory
                     embeddingCache.set(text, { embedding, timestamp: Date.now() });
@@ -813,7 +832,7 @@ export async function createAgent(
                         insertStmt.run(
                             stringToUuid(Date.now().toString()),
                             text,
-                            Buffer.from(embeddingArray),
+                            Buffer.from(embedding.buffer),
                             Date.now()
                         );
                     } catch (dbError) {
@@ -830,10 +849,10 @@ export async function createAgent(
             }
 
             elizaLogger.warn(`Embedding failed after ${MAX_RETRIES} attempts, using zero vector`);
-            return new Float32Array(1536).fill(0);
+            return new Float32Array(384).fill(0);
         } catch (error) {
             elizaLogger.error(`Embedding error: ${error}`);
-            return new Float32Array(1536).fill(0);
+            return new Float32Array(384).fill(0);
         }
     };
 
@@ -1009,74 +1028,147 @@ export async function createAgent(
     (runtime as any).rag = {
         search: async (query: string, limit: number) => {
             try {
+                // Extract username from query
+                const username = query.split('from:')[1]?.split(' ')[0] || '';
+                elizaLogger.info(`[RAG] Search request for user: ${username}`);
+
                 // Check cache first
-                const cacheKey = `search:${query}:${limit}`;
+                const cacheKey = `search:${query}:${limit}:${username}`;
                 const cached = ragCache.get(cacheKey);
                 if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+                    elizaLogger.info(`[RAG] Using cached results for user ${username}`);
                     return cached.data;
                 }
+
+                // Get recent conversation history first
+                const recentHistory = await database.getConversationHistory(
+                    query.split('conversation:')[1]?.split(' ')[0] || '',
+                    username
+                );
+                elizaLogger.info(`[RAG] Retrieved ${recentHistory.length} recent messages for context`);
 
                 // Perform search with retries
                 let attempts = 0;
                 const maxAttempts = 3;
                 while (attempts < maxAttempts) {
                     try {
-                        const embedding = await (runtime as any).embed(query);
+                        // Generate embedding for the query
+                        const queryEmbedding = await (runtime as any).embed(query);
+                        
+                        // Search using the knowledge manager
                         const results = await (runtime as any).ragKnowledgeManager.searchKnowledge({
                             agentId: runtime.agentId,
-                            embedding: embedding,
-                            match_threshold: 0.7,
+                            embedding: queryEmbedding,
+                            match_threshold: 0.5,
                             match_count: limit * 2, // Get more results for better reranking
-                            searchText: query
+                            searchText: query,
+                            metadata: {
+                                username: username
+                            }
                         });
+                        
+                        // Combine recent history with similarity results
+                        const combinedResults = [
+                            // Add recent history first for context
+                            ...recentHistory.map(msg => ({
+                                content: msg.content,
+                                metadata: msg.metadata,
+                                similarity: 1.0, // Give recent messages highest priority
+                                isRecent: true
+                            })),
+                            // Add similarity-based results
+                            ...(results || []).map(result => ({
+                                ...result,
+                                isRecent: false
+                            }))
+                        ];
 
-                        // Cache successful results
-                        ragCache.set(cacheKey, { data: results, timestamp: Date.now() });
-                        return results;
-                    } catch (error) {
-                        attempts++;
-                        if (attempts === maxAttempts) {
-                            elizaLogger.error(`RAG search failed after ${maxAttempts} attempts:`, error);
+                        // Remove duplicates based on content
+                        const uniqueResults = combinedResults.filter((result, index, self) =>
+                            index === self.findIndex((r) => r.content === result.content)
+                        );
+
+                        // Sort by recency first, then similarity
+                        const sortedResults = uniqueResults.sort((a, b) => {
+                            if (a.isRecent && !b.isRecent) return -1;
+                            if (!a.isRecent && b.isRecent) return 1;
+                            return b.similarity - a.similarity;
+                        }).slice(0, limit);
+
+                        if (sortedResults.length > 0) {
+                            // Cache successful results
+                            ragCache.set(cacheKey, { data: sortedResults, timestamp: Date.now() });
+                            elizaLogger.info(`[RAG] Search successful for user ${username}, found ${sortedResults.length} results (${recentHistory.length} recent, ${results?.length || 0} similar)`);
+                            return sortedResults;
+                        } else {
+                            elizaLogger.warn(`[RAG] No results found for user ${username}`);
                             return [];
                         }
-                        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
-                    }
-                }
-            } catch (error) {
-                elizaLogger.error(`RAG search error: ${error}`);
-                return [];
-            }
-        },
-        store: async (data: { id: string; content: string; metadata: any }) => {
-            try {
-                // Perform store with retries
-                let attempts = 0;
-                const maxAttempts = 3;
-                while (attempts < maxAttempts) {
-                    try {
-                        const embedding = await (runtime as any).embed(data.content);
-                        await (runtime as any).ragKnowledgeManager.createKnowledge({
-                            id: data.id,
-                            agentId: runtime.agentId,
-                            content: {
-                                text: data.content,
-                                metadata: data.metadata
-                            },
-                            embedding: embedding,
-                            createdAt: Date.now()
-                        });
-                        return;
                     } catch (error) {
                         attempts++;
+                        elizaLogger.error(`[RAG] Search attempt ${attempts} failed: ${error.message}`);
                         if (attempts === maxAttempts) {
-                            elizaLogger.error(`RAG store failed after ${maxAttempts} attempts:`, error);
-                            return;
+                            elizaLogger.error(`[RAG] Search failed after ${maxAttempts} attempts:`, error);
+                            // Return recent history as fallback
+                            return recentHistory;
                         }
                         await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
                     }
                 }
             } catch (error) {
-                elizaLogger.error(`RAG store error: ${error}`);
+                elizaLogger.error(`[RAG] Search error: ${error}`);
+                // Try to get recent history as fallback
+                try {
+                    const recentHistory = await database.getConversationHistory(
+                        query.split('conversation:')[1]?.split(' ')[0] || '',
+                        query.split('from:')[1]?.split(' ')[0] || ''
+                    );
+                    return recentHistory;
+                } catch (fallbackError) {
+                    elizaLogger.error(`[RAG] Fallback to recent history failed: ${fallbackError}`);
+                    return [];
+                }
+            }
+        },
+        store: async (data: { id: string; content: string; metadata: any; embedding: Buffer }) => {
+            try {
+                // Convert Buffer to number array and ensure 384 dimensions
+                let embeddingArray = Array.from(new Float32Array(data.embedding.buffer));
+                if (embeddingArray.length !== 384) {
+                    elizaLogger.warn(`[RAG] Converting embedding from ${embeddingArray.length} to 384 dimensions`);
+                    const reducedEmbedding = new Float32Array(384);
+                    const chunkSize = Math.floor(embeddingArray.length / 384);
+                    for (let i = 0; i < 384; i++) {
+                        let sum = 0;
+                        for (let j = 0; j < chunkSize; j++) {
+                            sum += embeddingArray[i * chunkSize + j] || 0;
+                        }
+                        reducedEmbedding[i] = sum / chunkSize;
+                    }
+                    // Normalize the reduced embedding
+                    const magnitude = Math.sqrt(reducedEmbedding.reduce((sum, val) => sum + val * val, 0));
+                    for (let i = 0; i < 384; i++) {
+                        reducedEmbedding[i] /= magnitude;
+                    }
+                    embeddingArray = Array.from(reducedEmbedding);
+                }
+                
+                // Store using the knowledge manager
+                await (runtime as any).ragKnowledgeManager.createKnowledge({
+                    id: data.id,
+                    agentId: runtime.agentId,
+                    content: {
+                        text: data.content,
+                        metadata: data.metadata
+                    },
+                    embedding: embeddingArray,
+                    createdAt: Date.now()
+                });
+                
+                elizaLogger.info(`[RAG] Successfully stored embedding for id ${data.id}`);
+            } catch (error) {
+                elizaLogger.error(`[RAG] Store error: ${error}`);
+                throw error;
             }
         }
     };
