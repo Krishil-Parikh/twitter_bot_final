@@ -29,6 +29,7 @@ export class TwitterIntegration {
     private conversationHistory: Map<string, Array<{ content: string; metadata: any }>> = new Map();
     private imageConversations: Map<string, { lastPrompt: string; lastImageUrl: string }> = new Map();
     private database: Database;
+    private processedTweetIds: Set<string> = new Set();
 
     get initialized(): boolean {
         return this.isInitialized;
@@ -42,6 +43,9 @@ export class TwitterIntegration {
 
     private async isTweetProcessed(tweetId: string): Promise<boolean> {
         try {
+            if (this.processedTweetIds.has(tweetId)) {
+                return true;
+            }
             return await this.database.isTweetReplied(tweetId);
         } catch (error) {
             elizaLogger.error(`Error checking if tweet ${tweetId} is processed:`, error);
@@ -50,23 +54,13 @@ export class TwitterIntegration {
     }
 
     private async markTweetAsProcessed(tweetId: string): Promise<void> {
-        let retryCount = 0;
-        const MAX_RETRIES = 3;
-        while (retryCount < MAX_RETRIES) {
-            try {
-                await this.database.markTweetAsReplied(tweetId);
-                elizaLogger.info(`Marked tweet ${tweetId} as processed`);
-                return;
-            } catch (error) {
-                retryCount++;
-                elizaLogger.error(`Failed to mark tweet ${tweetId} as processed (attempt ${retryCount}/${MAX_RETRIES}):`, error);
-                if (retryCount < MAX_RETRIES) {
-                    const backoffTime = 1000 * Math.pow(2, retryCount);
-                    await new Promise(resolve => setTimeout(resolve, backoffTime));
-                } else {
-                    elizaLogger.error(`Failed to mark tweet ${tweetId} as processed after ${MAX_RETRIES} attempts`);
-                }
-            }
+        try {
+            await this.database.markTweetAsReplied(tweetId);
+            this.processedTweetIds.add(tweetId);
+            elizaLogger.info(`Marked tweet ${tweetId} as processed`);
+        } catch (error) {
+            elizaLogger.error(`Failed to mark tweet ${tweetId} as processed:`, error);
+            throw error;
         }
     }
 
@@ -75,6 +69,11 @@ export class TwitterIntegration {
 
         try {
             await this.database.initialize();
+            // Load recently processed tweets
+            const recentTweets = await this.database.getRecentProcessedTweets(1000);
+            recentTweets.forEach(tweetId => this.processedTweetIds.add(tweetId));
+            elizaLogger.info(`Loaded ${recentTweets.length} recently processed tweets`);
+
             const requiredEnvVars = ['TWITTER_USERNAME', 'TWITTER_PASSWORD', 'TWITTER_EMAIL'];
             for (const envVar of requiredEnvVars) {
                 if (!process.env[envVar]) throw new Error(`Missing required environment variable: ${envVar}`);
@@ -171,31 +170,25 @@ export class TwitterIntegration {
         const startTime = performance.now();
         try {
             if (!tweet.inReplyToStatusId) {
-                elizaLogger.info(`No reply context for tweet ${tweet.id}, skipping RAG`);
-                return tweet.text;
+                elizaLogger.info(`No reply context for tweet ${tweet.id}, using tweet text`);
+                return `@${tweet.username}: ${tweet.text}`;
             }
 
-            const historyQuery = `conversation:${conversationId}`;
+            const historyQuery = `from:${tweet.username} OR conversation:${conversationId}`;
             let historyResults: Array<{ content: string; metadata: any }> = [];
 
-            if (this.conversationHistory.has(historyQuery)) {
-                elizaLogger.info(`Using cached history for conversation ${conversationId}`);
-                historyResults = this.conversationHistory.get(historyQuery)!;
-            } else {
-                try {
-                    const searchStart = performance.now();
-                    historyResults = await this.runtime.rag.search(historyQuery, 5);
-                    elizaLogger.info(`RAG search took ${(performance.now() - searchStart).toFixed(2)}ms`);
-                    this.conversationHistory.set(historyQuery, historyResults);
-                } catch (error) {
-                    elizaLogger.error(`Failed to search RAG for tweet ${tweet.id}:`, error);
-                    historyResults = await this.database.getConversationHistory(conversationId);
-                    this.conversationHistory.set(historyQuery, historyResults);
-                }
+            try {
+                const searchStart = performance.now();
+                historyResults = await this.searchRAG(historyQuery, 5);
+                elizaLogger.info(`RAG search took ${(performance.now() - searchStart).toFixed(2)}ms`);
+                this.conversationHistory.set(historyQuery, historyResults);
+            } catch (error) {
+                elizaLogger.warn(`RAG search failed for tweet ${tweet.id}:`, error);
+                historyResults = await this.database.getConversationHistory(conversationId, tweet.username);
+                this.conversationHistory.set(historyQuery, historyResults);
             }
 
             const tweetText = `@${tweet.username}: ${tweet.text}`;
-
             try {
                 await this.database.storeConversationHistory({
                     conversationId,
@@ -206,19 +199,15 @@ export class TwitterIntegration {
                     type: 'tweet'
                 });
 
-                try {
-                    const storeStart = performance.now();
-                    await this.runtime.rag.store({
-                        id: stringToUuid(Date.now().toString()),
-                        content: tweetText,
-                        metadata: { conversationId, timestamp: Date.now(), username: tweet.username, tweetId: tweet.id, type: 'tweet' }
-                    });
-                    elizaLogger.info(`RAG store took ${(performance.now() - storeStart).toFixed(2)}ms`);
-                } catch (error) {
-                    elizaLogger.warn(`Failed to store tweet in RAG for tweet ${tweet.id}:`, error);
-                }
+                await this.storeInRAG(tweetText, {
+                    conversationId,
+                    tweetId: tweet.id,
+                    username: tweet.username,
+                    timestamp: Date.now(),
+                    type: 'tweet'
+                });
             } catch (error) {
-                elizaLogger.error(`Failed to store conversation history in database for tweet ${tweet.id}:`, error);
+                elizaLogger.error(`Failed to store conversation history for tweet ${tweet.id}:`, error);
             }
 
             if (tweet.inReplyToStatusId) {
@@ -226,40 +215,35 @@ export class TwitterIntegration {
                     const parentTweet = await this.scraper.getTweet(tweet.inReplyToStatusId);
                     if (parentTweet) {
                         const parentText = `@${parentTweet.username}: ${parentTweet.text}`;
-                        try {
-                            await this.database.storeConversationHistory({
-                                conversationId,
-                                tweetId: parentTweet.id,
-                                username: parentTweet.username,
-                                content: parentText,
-                                timestamp: Date.now(),
-                                type: 'parent_tweet'
-                            });
-
-                            try {
-                                await this.runtime.rag.store({
-                                    id: stringToUuid(parentTweet.id),
-                                    content: parentText,
-                                    metadata: { conversationId, timestamp: Date.now(), username: parentTweet.username, tweetId: parentTweet.id, type: 'parent_tweet' }
-                                });
-                            } catch (error) {
-                                elizaLogger.warn(`Failed to store parent tweet in RAG for tweet ${tweet.id}:`, error);
-                            }
-                        } catch (error) {
-                            elizaLogger.error(`Failed to store parent conversation history in database for tweet ${tweet.id}:`, error);
-                        }
+                        await this.database.storeConversationHistory({
+                            conversationId,
+                            tweetId: parentTweet.id,
+                            username: parentTweet.username,
+                            content: parentText,
+                            timestamp: Date.now(),
+                            type: 'parent_tweet'
+                        });
+                        await this.storeInRAG(parentText, {
+                            conversationId,
+                            tweetId: parentTweet.id,
+                            username: parentTweet.username,
+                            timestamp: Date.now(),
+                            type: 'parent_tweet'
+                        });
                     }
                 } catch (error) {
                     elizaLogger.error(`Failed to get parent tweet ${tweet.inReplyToStatusId}:`, error);
                 }
             }
 
-            const conversationContext = historyResults.map(result => result.content).join('\n\n');
+            const conversationContext = historyResults.length > 0
+                ? historyResults.map(result => result.content).join('\n\n')
+                : tweetText;
             elizaLogger.info(`Built conversation context for tweet ${tweet.id} in ${(performance.now() - startTime).toFixed(2)}ms`);
-            return conversationContext || tweet.text;
+            return conversationContext;
         } catch (error) {
             elizaLogger.error(`Error building conversation context for tweet ${tweet.id}:`, error);
-            return tweet.text;
+            return `@${tweet.username}: ${tweet.text}`;
         }
     }
 
@@ -362,17 +346,16 @@ export class TwitterIntegration {
                     type: 'image_generation'
                 });
 
-                try {
-                    await this.runtime.rag.store({
-                        id: memory.id,
-                        content: `Generated image: ${prompt}`,
-                        metadata: { conversationId: tweet.conversationId, timestamp: Date.now(), type: 'image_generation', prompt, tweetId: tweet.id }
-                    });
-                } catch (error) {
-                    elizaLogger.warn(`Failed to store image in RAG for tweet ${tweet.id}:`, error);
-                }
+                await this.storeInRAG(`Generated image: ${prompt}`, {
+                    conversationId: tweet.conversationId,
+                    tweetId: tweet.id,
+                    username: tweet.username,
+                    timestamp: Date.now(),
+                    type: 'image_generation',
+                    prompt
+                });
             } catch (error) {
-                elizaLogger.error(`Failed to store image conversation history in database for tweet ${tweet.id}:`, error);
+                elizaLogger.error(`Failed to store image history for tweet ${tweet.id}:`, error);
             }
 
             const state: State = {
@@ -547,7 +530,7 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
             const historyQuery = `conversation:${tweet.conversationId} type:image_generation`;
             let historyResults: Array<{ content: string; metadata: any }> = [];
             try {
-                historyResults = await this.runtime.rag.search(historyQuery, 3);
+                historyResults = await this.searchRAG(historyQuery, 3);
             } catch (error) {
                 elizaLogger.warn(`Failed to fetch RAG history for tweet ${tweet.id}:`, error);
             }
@@ -658,7 +641,6 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 await this.initializeScraper();
             }
 
-            const processedTweetIds = new Set<string>();
             const tweetBatch: any[] = [];
             const searchQuery = `@${username}`;
             let retryCount = 0;
@@ -668,42 +650,23 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 try {
                     const searchStart = performance.now();
                     const mentionsGenerator = this.scraper.searchTweets(searchQuery, 10, SearchMode.Latest);
-                    
-                    try {
-                        const tweets = [];
-                        const timeoutPromise = new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('Search timeout')), 60000)
-                        );
+                    const tweets = [];
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Search timeout')), 60000)
+                    );
 
-                        // Use Promise.race to handle timeout properly
-                        await Promise.race([
-                            (async () => {
-                                for await (const tweet of mentionsGenerator) {
-                                    tweets.push(tweet);
-                                    if (tweets.length >= 10) break;
-                                }
-                            })(),
-                            timeoutPromise
-                        ]);
-
-                        tweetBatch.push(...tweets);
-                        elizaLogger.info(`Search query "${searchQuery}" took ${(performance.now() - searchStart).toFixed(2)}ms, fetched ${tweets.length} tweets`);
-                    } catch (error) {
-                        if (error.message === 'Search timeout') {
-                            elizaLogger.warn('Search timed out, continuing with partial results');
-                            // Continue with any tweets we've collected so far
-                            if (tweetBatch.length > 0) {
-                                elizaLogger.info(`Continuing with ${tweetBatch.length} tweets collected before timeout`);
-                            } else {
-                                elizaLogger.warn('No tweets collected before timeout, skipping this cycle');
-                                return;
+                    await Promise.race([
+                        (async () => {
+                            for await (const tweet of mentionsGenerator) {
+                                tweets.push(tweet);
+                                if (tweets.length >= 10) break;
                             }
-                        } else {
-                            elizaLogger.error(`Search error: ${error.message}`);
-                            throw error;
-                        }
-                    }
+                        })(),
+                        timeoutPromise
+                    ]);
 
+                    tweetBatch.push(...tweets);
+                    elizaLogger.info(`Search query "${searchQuery}" took ${(performance.now() - searchStart).toFixed(2)}ms, fetched ${tweets.length} tweets`);
                     break;
                 } catch (error) {
                     retryCount++;
@@ -728,26 +691,26 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 elizaLogger.info(`Processing mention: ${tweet.id} from @${tweet.username}: ${tweet.text}`);
 
                 try {
-                    if (processedTweetIds.has(tweet.id)) {
-                        elizaLogger.info(`Skipping duplicate tweet ${tweet.id}`);
+                    if (this.processedTweetIds.has(tweet.id)) {
+                        elizaLogger.info(`Skipping duplicate tweet ${tweet.id} (in-memory cache)`);
                         return;
                     }
 
                     if (tweet.username.toLowerCase() === username) {
                         elizaLogger.info(`Skipping bot's own tweet: ${tweet.id}`);
-                        processedTweetIds.add(tweet.id);
+                        this.processedTweetIds.add(tweet.id);
                         return;
                     }
 
                     if (tweet.isRetweet) {
                         elizaLogger.info(`Skipping retweet: ${tweet.id}`);
-                        processedTweetIds.add(tweet.id);
+                        this.processedTweetIds.add(tweet.id);
                         return;
                     }
 
                     if (!tweet.text.toLowerCase().includes(`@${username}`)) {
                         elizaLogger.info(`Skipping tweet ${tweet.id} - does not contain @${username}`);
-                        processedTweetIds.add(tweet.id);
+                        this.processedTweetIds.add(tweet.id);
                         return;
                     }
 
@@ -759,12 +722,12 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                             elizaLogger.warn(`Tweet ${tweet.id} marked as processed but no reply found, reprocessing`);
                         } else {
                             elizaLogger.info(`Skipping already processed tweet ${tweet.id}`);
-                            processedTweetIds.add(tweet.id);
+                            this.processedTweetIds.add(tweet.id);
                             return;
                         }
                     }
 
-                    processedTweetIds.add(tweet.id);
+                    this.processedTweetIds.add(tweet.id);
                     const cleanText = tweet.text.replace(/@\w+/g, '').trim();
                     if (!cleanText) {
                         elizaLogger.info(`Skipping empty tweet ${tweet.id}`);
@@ -803,6 +766,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
 
                     if (success) {
                         await this.markTweetAsProcessed(tweet.id);
+                        this.conversationHistory.delete(`from:${tweet.username} OR conversation:${tweet.conversationId}`);
                         mentionsCount++;
                     } else {
                         elizaLogger.warn(`Failed to process tweet ${tweet.id}, not marking as processed`);
@@ -837,25 +801,40 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
         } finally {
             this.isProcessing = false;
-            this.conversationHistory.clear();
             elizaLogger.info(`Polling cycle completed in ${(performance.now() - startTime).toFixed(2)}ms`);
         }
     }
 
     private async verifyTweetReplied(tweetId: string, username: string): Promise<boolean> {
-        try {
-            const botTweets = this.scraper.searchTweets(`from:${username} @${username}`, 10, SearchMode.Latest);
-            for await (const botTweet of botTweets) {
-                if (botTweet.inReplyToStatusId === tweetId) {
-                    elizaLogger.info(`Found reply to tweet ${tweetId}: ${botTweet.id}`);
-                    return true;
+        const MAX_RETRIES = 3;
+        let retryCount = 0;
+        while (retryCount < MAX_RETRIES) {
+            try {
+                const botTweets = await this.scraper.searchTweets(`from:${username} is:reply`, 50, SearchMode.Latest);
+                const tweets = [];
+                for await (const tweet of botTweets) {
+                    tweets.push(tweet);
+                    if (tweets.length >= 50) break;
+                }
+                for (const botTweet of tweets) {
+                    if (botTweet.inReplyToStatusId === tweetId) {
+                        elizaLogger.info(`Found reply to tweet ${tweetId}: ${botTweet.id}`);
+                        return true;
+                    }
+                }
+                return false;
+            } catch (error) {
+                retryCount++;
+                elizaLogger.error(`Error verifying reply for tweet ${tweetId} (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+                if (retryCount < MAX_RETRIES) {
+                    const backoffTime = 2000 * Math.pow(2, retryCount);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                } else {
+                    return false;
                 }
             }
-            return false;
-        } catch (error) {
-            elizaLogger.error(`Error verifying reply for tweet ${tweetId}:`, error);
-            return;
         }
+        return false;
     }
 
     async stop(): Promise<void> {
@@ -879,11 +858,8 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
 
             const replyContent = `@${tweet.username} ${content}`;
-            
-            // Use scraper's sendTweet method directly
             const result = await this.scraper.sendTweet(replyContent, tweetId);
             
-            // Check if the tweet was sent successfully
             if (!result.ok) {
                 const errorText = await result.text();
                 throw new Error(`Failed to send tweet: ${errorText}`);
@@ -903,10 +879,8 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 await this.initializeScraper();
             }
 
-            // Use scraper's sendTweet method directly
             const result = await this.scraper.sendTweet(content);
             
-            // Check if the tweet was sent successfully
             if (!result.ok) {
                 const errorText = await result.text();
                 throw new Error(`Failed to send tweet: ${errorText}`);
@@ -979,16 +953,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 };
 
                 const context = await composeContext({
-                    state: {
-                        bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                        lore: this.runtime.character.lore.join(' '),
-                        messageDirections: this.runtime.character.style.post.join(' '),
-                        postDirections: this.runtime.character.style.post.join(' '),
-                        roomId: this.runtime.agentId,
-                        actors: this.runtime.character.name,
-                        recentMessages: `Generate a tweet about ${randomTopic}`,
-                        recentMessagesData: []
-                    },
+                    state,
                     template: `You are ${this.runtime.character.name}. Generate a tweet that is ${randomAdjective} about ${randomTopic}}. The tweet should ${randomStyle}}. Keep it under 280 characters. No hashtags or emojis.`
                 });
 
@@ -1053,28 +1018,31 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 const conversationId = tweet.inReplyToStatusId || tweet.id;
                 const context = await this.buildConversationContext(tweet, conversationId);
 
+                const state: State = {
+                    bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
+                    lore: this.runtime.character.lore.join(' '),
+                    messageDirections: this.runtime.character.style.post.join(' '),
+                    postDirections: this.runtime.character.style.post.join(' '),
+                    roomId: stringToUuid(conversationId),
+                    actors: this.runtime.character.name,
+                    recentMessages: context,
+                    recentMessagesData: []
+                };
+
                 return await generateText({
                     runtime: this.runtime,
                     context: composeContext({
-                        state: {
-                            bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                            lore: this.runtime.character.lore.join(' '),
-                            messageDirections: this.runtime.character.style.post.join(' '),
-                            postDirections: this.runtime.character.style.post.join(' '),
-                            roomId: stringToUuid(conversationId),
-                            actors: this.runtime.character.name,
-                            recentMessages: context,
-                            recentMessagesData: []
-                        },
-                        template: `You are Jesus Christ}. Respond to this tweet: "${cleanText}": using one of these formats:
-                        1. A relevant Scripture quote
-                        2. A paraphrased biblical truth
-                        3. A Christlike question
-                        4. A short modern parable
+                        state,
+                        template: `You are ${this.runtime.character.name}. Respond to this tweet from @${tweet.username}: "${cleanText}" using one of these formats:
+1. A relevant Scripture quote
+2. A paraphrased biblical truth
+3. A Christlike question
+4. A short modern parable
 
-                        Previous conversation:\n
-                        ${context}
-                        Keep it under 280 characters. No hashtags or emojis.`
+Previous conversation context:
+${context}
+
+Keep the response under 280 characters. No hashtags or emojis. Ensure the reply maintains conversational flow and is relevant to the user's tweet and their previous interactions.`
                     }),
                     modelClass: ModelClass.SMALL
                 });
@@ -1099,5 +1067,68 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             throw error;
         }
     }
+
+    private async storeInRAG(content: string, metadata: any): Promise<void> {
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
+        while (retryCount < MAX_RETRIES) {
+            try {
+                await this.runtime.rag.store({
+                    id: stringToUuid(Date.now().toString()),
+                    content,
+                    metadata
+                });
+                elizaLogger.info(`Stored in RAG: ${content.slice(0, 50)}...`);
+                return;
+            } catch (error) {
+                retryCount++;
+                if (error.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+                    elizaLogger.warn(`Duplicate RAG entry detected, skipping: ${error.message}`);
+                    return;
+                }
+                if (error.message.includes('embedding')) {
+                    elizaLogger.warn(`Embedding failure for content: ${content.slice(0, 50)}...`);
+                }
+                if (retryCount < MAX_RETRIES) {
+                    const backoffTime = 1000 * Math.pow(2, retryCount);
+                    elizaLogger.warn(`RAG store failed (attempt ${retryCount}/${MAX_RETRIES}), retrying in ${backoffTime}ms`);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                } else {
+                    elizaLogger.error(`RAG store failed after ${MAX_RETRIES} attempts: ${error.message}`);
+                    await this.database.storeConversationHistory({
+                        conversationId: metadata.conversationId,
+                        tweetId: metadata.tweetId,
+                        username: metadata.username || 'unknown',
+                        content,
+                        timestamp: metadata.timestamp,
+                        type: metadata.type
+                    });
+                }
+            }
+        }
+    }
+
+    private async searchRAG(query: string, limit: number): Promise<Array<{ content: string; metadata: any }>> {
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
+        while (retryCount < MAX_RETRIES) {
+            try {
+                const results = await this.runtime.rag.search(query, limit);
+                elizaLogger.info(`RAG search successful for query: ${query}`);
+                return results;
+            } catch (error) {
+                retryCount++;
+                elizaLogger.error(`RAG search failed for query "${query}" (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
+                if (retryCount < MAX_RETRIES) {
+                    const backoffTime = 1000 * Math.pow(2, retryCount);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                } else {
+                    const conversationId = query.includes('conversation:') ? query.replace('conversation:', '') : '';
+                    const username = query.includes('from:') ? query.split(' OR ')[0].replace('from:', '') : '';
+                    return await this.database.getConversationHistory(conversationId, username);
+                }
+            }
+        }
+        return [];
+    }
 }
- 
