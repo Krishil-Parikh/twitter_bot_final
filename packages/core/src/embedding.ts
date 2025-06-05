@@ -3,6 +3,7 @@ import { type IAgentRuntime, ModelProviderName } from "./types.ts";
 import settings from "./settings.ts";
 import elizaLogger from "./logger.ts";
 import LocalEmbeddingModelManager from "./localembeddingManager.ts";
+import { IAgentRuntime as CoreIAgentRuntime } from '@elizaos/core';
 
 interface EmbeddingOptions {
     model: string;
@@ -94,15 +95,17 @@ async function getRemoteEmbedding(
             dimensions:
                 options.dimensions ||
                 options.length ||
-                getEmbeddingConfig().dimensions, // Prefer dimensions, fallback to length
+                getEmbeddingConfig().dimensions,
         }),
     };
 
     try {
+        elizaLogger.debug(`Making remote embedding request to ${fullUrl}`);
         const response = await fetch(fullUrl, requestOptions);
 
         if (!response.ok) {
-            elizaLogger.error("API Response:", await response.text()); // Debug log
+            const errorText = await response.text();
+            elizaLogger.error("API Response:", errorText);
             throw new Error(
                 `Embedding API Error: ${response.status} ${response.statusText}`
             );
@@ -113,7 +116,17 @@ async function getRemoteEmbedding(
         }
 
         const data: EmbeddingResponse = await response.json();
-        return data?.data?.[0].embedding;
+        if (!data?.data?.[0]?.embedding) {
+            throw new Error("Invalid response format from embedding API");
+        }
+
+        const embedding = data.data[0].embedding;
+        if (embedding.length === 0) {
+            throw new Error("Empty embedding received from API");
+        }
+
+        elizaLogger.debug(`Received embedding of size ${embedding.length}`);
+        return embedding;
     } catch (e) {
         elizaLogger.error("Full error details:", e);
         throw e;
@@ -164,6 +177,39 @@ export function getEmbeddingZeroVector(): number[] {
     return Array(embeddingDimension).fill(0);
 }
 
+interface IAgentRuntimeWithEmbedding extends CoreIAgentRuntime {
+    cache: {
+        get(key: string): Promise<any>;
+        set(key: string, value: any): Promise<void>;
+    };
+    generateEmbedding(text: string): Promise<number[]>;
+}
+
+async function retrieveCachedEmbedding(runtime: IAgentRuntimeWithEmbedding, text: string): Promise<number[] | null> {
+    try {
+        const cacheKey = `embedding:${text}`;
+        const cached = await runtime.cache.get(cacheKey);
+        if (cached) {
+            elizaLogger.info(`[Embed] Retrieved cached embedding of size ${cached.length}`);
+            return cached;
+        }
+        return null;
+    } catch (error) {
+        elizaLogger.warn('[Embed] Cache retrieval failed:', error);
+        return null;
+    }
+}
+
+async function cacheEmbedding(runtime: IAgentRuntimeWithEmbedding, text: string, embedding: number[]): Promise<void> {
+    try {
+        const cacheKey = `embedding:${text}`;
+        await runtime.cache.set(cacheKey, embedding);
+        elizaLogger.info(`[Embed] Cached embedding of size ${embedding.length}`);
+    } catch (error) {
+        elizaLogger.warn('[Embed] Cache storage failed:', error);
+    }
+}
+
 /**
  * Gets embeddings from a remote API endpoint.  Falls back to local BGE/384
  *
@@ -179,126 +225,105 @@ export function getEmbeddingZeroVector(): number[] {
  * @throws {Error} If the API request fails
  */
 
-export async function embed(runtime: IAgentRuntime, input: string) {
-    elizaLogger.debug("Embedding request:", {
-        modelProvider: runtime.character.modelProvider,
-        useOpenAI: process.env.USE_OPENAI_EMBEDDING,
-        input: input?.slice(0, 50) + "...",
-        inputType: typeof input,
-        inputLength: input?.length,
-        isString: typeof input === "string",
-        isEmpty: !input,
-    });
+export async function embed(runtime: IAgentRuntimeWithEmbedding, text: string): Promise<number[]> {
+    elizaLogger.info(`[Embed] Starting embedding generation for text length: ${text.length}`);
+    elizaLogger.info(`[Embed] Text preview: ${text.slice(0, 100)}...`);
 
-    // Validate input
-    if (!input || typeof input !== "string" || input.trim().length === 0) {
-        elizaLogger.warn("Invalid embedding input:", {
-            input,
-            type: typeof input,
-            length: input?.length,
-        });
-        return []; // Return empty embedding array
+    // Input validation
+    if (!text || text.trim().length === 0) {
+        elizaLogger.warn('[Embed] Empty input text, returning zero vector');
+        return new Array(384).fill(0);
     }
 
-    // Check cache first
-    const cachedEmbedding = await retrieveCachedEmbedding(runtime, input);
-    if (cachedEmbedding) return cachedEmbedding;
-
-    const config = getEmbeddingConfig();
-    const isNode = typeof process !== "undefined" && process.versions?.node;
-
-    // Determine which embedding path to use
-    if (config.provider === EmbeddingProvider.OpenAI) {
-        return await getRemoteEmbedding(input, {
-            model: config.model,
-            endpoint: settings.OPENAI_API_URL || "https://api.openai.com/v1",
-            apiKey: settings.OPENAI_API_KEY,
-            dimensions: config.dimensions,
-        });
-    }
-
-    if (config.provider === EmbeddingProvider.Ollama) {
-        return await getRemoteEmbedding(input, {
-            model: config.model,
-            endpoint:
-                runtime.character.modelEndpointOverride ||
-                getEndpoint(ModelProviderName.OLLAMA),
-            isOllama: true,
-            dimensions: config.dimensions,
-        });
-    }
-
-    if (config.provider == EmbeddingProvider.GaiaNet) {
-        return await getRemoteEmbedding(input, {
-            model: config.model,
-            endpoint:
-                runtime.character.modelEndpointOverride ||
-                getEndpoint(ModelProviderName.GAIANET) ||
-                settings.SMALL_GAIANET_SERVER_URL ||
-                settings.MEDIUM_GAIANET_SERVER_URL ||
-                settings.LARGE_GAIANET_SERVER_URL,
-            apiKey: settings.GAIANET_API_KEY || runtime.token,
-            dimensions: config.dimensions,
-        });
-    }
-
-    if (config.provider === EmbeddingProvider.Heurist) {
-        return await getRemoteEmbedding(input, {
-            model: config.model,
-            endpoint: getEndpoint(ModelProviderName.HEURIST),
-            apiKey: runtime.token,
-            dimensions: config.dimensions,
-        });
-    }
-
-    // BGE - try local first if in Node
-    if (isNode) {
-        try {
-            return await getLocalEmbedding(input);
-        } catch (error) {
-            elizaLogger.warn(
-                "Local embedding failed, falling back to remote",
-                error
-            );
+    try {
+        // Try to get from cache first
+        const cachedEmbedding = await retrieveCachedEmbedding(runtime, text);
+        if (cachedEmbedding) {
+            elizaLogger.info(`[Embed] Using cached embedding of size ${cachedEmbedding.length}`);
+            return cachedEmbedding;
         }
-    }
 
-    // Fallback to remote override
-    return await getRemoteEmbedding(input, {
-        model: config.model,
-        endpoint:
-            runtime.character.modelEndpointOverride ||
-            getEndpoint(runtime.character.modelProvider),
-        apiKey: runtime.token,
-        dimensions: config.dimensions,
-    });
-
-    async function getLocalEmbedding(input: string): Promise<number[]> {
-        elizaLogger.debug("DEBUG - Inside getLocalEmbedding function");
-
+        // Try local embedding first
+        elizaLogger.info('[Embed] Attempting local embedding generation...');
         try {
-            const embeddingManager = LocalEmbeddingModelManager.getInstance();
-            return await embeddingManager.generateEmbedding(input);
+            const localEmbedding = await getLocalEmbedding(runtime, text);
+            if (localEmbedding && localEmbedding.length > 0) {
+                elizaLogger.info(`[Embed] Successfully generated local embedding of size ${localEmbedding.length}`);
+                await cacheEmbedding(runtime, text, localEmbedding);
+                return localEmbedding;
+            }
         } catch (error) {
-            elizaLogger.error("Local embedding failed:", error);
+            elizaLogger.warn('[Embed] Local embedding generation failed:', {
+                error: error.message,
+                stack: error.stack,
+                code: error.code,
+                name: error.name
+            });
+        }
+
+        // Fallback to remote embedding
+        elizaLogger.info('[Embed] Attempting remote embedding generation...');
+        try {
+            const remoteEmbedding = await getRemoteEmbedding(text, {
+                model: 'text-embedding-3-small',
+                endpoint: process.env.OPENAI_API_ENDPOINT || 'https://api.openai.com/v1/embeddings',
+                apiKey: process.env.OPENAI_API_KEY,
+                dimensions: 384
+            });
+
+            if (!remoteEmbedding || !Array.isArray(remoteEmbedding)) {
+                throw new Error(`Invalid remote embedding response: ${typeof remoteEmbedding}`);
+            }
+
+            if (remoteEmbedding.length === 0) {
+                throw new Error('Empty remote embedding array');
+            }
+
+            elizaLogger.info(`[Embed] Successfully generated remote embedding of size ${remoteEmbedding.length}`);
+            await cacheEmbedding(runtime, text, remoteEmbedding);
+            return remoteEmbedding;
+        } catch (error) {
+            elizaLogger.error('[Embed] Remote embedding generation failed:', {
+                error: error.message,
+                stack: error.stack,
+                code: error.code,
+                name: error.name,
+                text: text.slice(0, 100)
+            });
             throw error;
         }
+    } catch (error) {
+        elizaLogger.error('[Embed] All embedding attempts failed:', {
+            error: error.message,
+            stack: error.stack,
+            code: error.code,
+            name: error.name,
+            text: text.slice(0, 100)
+        });
+        return new Array(384).fill(0);
     }
+}
 
-    async function retrieveCachedEmbedding(
-        runtime: IAgentRuntime,
-        input: string
-    ) {
-        if (!input) {
-            elizaLogger.log("No input to retrieve cached embedding for");
-            return null;
+async function getLocalEmbedding(runtime: IAgentRuntimeWithEmbedding, text: string): Promise<number[]> {
+    elizaLogger.info('[Embed] Starting local embedding generation...');
+    try {
+        const embedding = await runtime.generateEmbedding(text);
+        if (!embedding || !Array.isArray(embedding)) {
+            throw new Error(`Invalid local embedding response: ${typeof embedding}`);
         }
-
-        const similaritySearchResult =
-            await runtime.messageManager.getCachedEmbeddings(input);
-        if (similaritySearchResult.length > 0) {
-            return similaritySearchResult[0].embedding;
+        if (embedding.length === 0) {
+            throw new Error('Empty local embedding array');
         }
-        return null;
+        elizaLogger.info(`[Embed] Local embedding generated successfully, size: ${embedding.length}`);
+        return embedding;
+    } catch (error) {
+        elizaLogger.error('[Embed] Local embedding generation failed:', {
+            error: error.message,
+            stack: error.stack,
+            code: error.code,
+            name: error.name,
+            text: text.slice(0, 100)
+        });
+        throw error;
     }
 }

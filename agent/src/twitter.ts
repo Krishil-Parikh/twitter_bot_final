@@ -1,14 +1,19 @@
-import { type IAgentRuntime, elizaLogger, type Memory, type State, stringToUuid, generateText, ModelClass, composeContext, AgentRuntime } from '@elizaos/core';
+import { type IAgentRuntime, elizaLogger, type Memory, type State, stringToUuid, generateText, ModelClass, composeContext, AgentRuntime, embed } from '@elizaos/core';
 import { Scraper, SearchMode, Tweet } from 'agent-twitter-client';
 import { Database } from './database';
 
 interface IRAG {
     search(query: string, limit: number): Promise<Array<{ content: string; metadata: any }>>;
-    store(data: { id: string; content: string; metadata: any }): Promise<void>;
+    store(data: { id: string; content: string; metadata: any; embedding: Buffer }): Promise<void>;
 }
 
 export interface IAgentRuntimeWithRAG extends AgentRuntime {
     rag: IRAG;
+    generateEmbedding(text: string): Promise<number[]>;
+    cache: {
+        get(key: string): Promise<any>;
+        set(key: string, value: any): Promise<void>;
+    };
 }
 
 interface TweetIntent {
@@ -38,7 +43,7 @@ export class TwitterIntegration {
     constructor(runtime: IAgentRuntimeWithRAG) {
         this.runtime = runtime;
         this.scraper = new Scraper();
-        this.database = new Database();
+        this.database = new Database(runtime);
     }
 
     private async isTweetProcessed(tweetId: string): Promise<boolean> {
@@ -48,19 +53,30 @@ export class TwitterIntegration {
             }
             return await this.database.isTweetReplied(tweetId);
         } catch (error) {
-            elizaLogger.error(`Error checking if tweet ${tweetId} is processed:`, error);
+            elizaLogger.error(`Error checking if tweet ${tweetId} is processed: ${error.message}`, error);
             return false;
         }
     }
 
     private async markTweetAsProcessed(tweetId: string): Promise<void> {
-        try {
-            await this.database.markTweetAsReplied(tweetId);
-            this.processedTweetIds.add(tweetId);
-            elizaLogger.info(`Marked tweet ${tweetId} as processed`);
-        } catch (error) {
-            elizaLogger.error(`Failed to mark tweet ${tweetId} as processed:`, error);
-            throw error;
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
+        while (retryCount < MAX_RETRIES) {
+            try {
+                await this.database.markTweetAsReplied(tweetId);
+                this.processedTweetIds.add(tweetId);
+                elizaLogger.info(`Marked tweet ${tweetId} as processed`);
+                return;
+            } catch (error) {
+                retryCount++;
+                elizaLogger.error(`Failed to mark tweet ${tweetId} as processed (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`, error);
+                if (retryCount < MAX_RETRIES) {
+                    const backoffTime = 1000 * Math.pow(2, retryCount);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                } else {
+                    throw error;
+                }
+            }
         }
     }
 
@@ -69,7 +85,6 @@ export class TwitterIntegration {
 
         try {
             await this.database.initialize();
-            // Load recently processed tweets
             const recentTweets = await this.database.getRecentProcessedTweets(1000);
             recentTweets.forEach(tweetId => this.processedTweetIds.add(tweetId));
             elizaLogger.info(`Loaded ${recentTweets.length} recently processed tweets`);
@@ -103,7 +118,7 @@ export class TwitterIntegration {
                     elizaLogger.info('Successfully logged in to Twitter');
                 } catch (error) {
                     retryCount++;
-                    elizaLogger.error(`Login attempt ${retryCount} failed:`, error);
+                    elizaLogger.error(`Login attempt ${retryCount} failed: ${error.message}`, error);
                     if (retryCount < MAX_RETRIES) {
                         const backoffTime = 2000 * Math.pow(2, retryCount);
                         await new Promise(resolve => setTimeout(resolve, backoffTime));
@@ -123,7 +138,7 @@ export class TwitterIntegration {
     }
 
     private async handleError(error: any, operation: string): Promise<void> {
-        elizaLogger.error(`Error during ${operation}:`, error);
+        elizaLogger.error(`Error during ${operation}: ${error.message}`, error);
     }
 
     private async startPolling(): Promise<void> {
@@ -174,18 +189,23 @@ export class TwitterIntegration {
                 return `@${tweet.username}: ${tweet.text}`;
             }
 
-            const historyQuery = `from:${tweet.username} OR conversation:${conversationId}`;
+            const historyQuery = `from:${tweet.username} conversation:${conversationId}`;
             let historyResults: Array<{ content: string; metadata: any }> = [];
 
-            try {
-                const searchStart = performance.now();
-                historyResults = await this.searchRAG(historyQuery, 5);
-                elizaLogger.info(`RAG search took ${(performance.now() - searchStart).toFixed(2)}ms`);
-                this.conversationHistory.set(historyQuery, historyResults);
-            } catch (error) {
-                elizaLogger.warn(`RAG search failed for tweet ${tweet.id}:`, error);
-                historyResults = await this.database.getConversationHistory(conversationId, tweet.username);
-                this.conversationHistory.set(historyQuery, historyResults);
+            if (this.conversationHistory.has(historyQuery)) {
+                elizaLogger.info(`Using cached history for query ${historyQuery}`);
+                historyResults = this.conversationHistory.get(historyQuery)!;
+            } else {
+                try {
+                    const searchStart = performance.now();
+                    historyResults = await this.searchRAG(historyQuery, 3);
+                    elizaLogger.info(`RAG search took ${(performance.now() - searchStart).toFixed(2)}ms`);
+                    this.conversationHistory.set(historyQuery, historyResults);
+                } catch (error) {
+                    elizaLogger.warn(`RAG search failed for tweet ${tweet.id}: ${error.message}`);
+                    historyResults = await this.database.getConversationHistory(conversationId, tweet.username);
+                    this.conversationHistory.set(historyQuery, historyResults);
+                }
             }
 
             const tweetText = `@${tweet.username}: ${tweet.text}`;
@@ -207,7 +227,7 @@ export class TwitterIntegration {
                     type: 'tweet'
                 });
             } catch (error) {
-                elizaLogger.error(`Failed to store conversation history for tweet ${tweet.id}:`, error);
+                elizaLogger.error(`Failed to store conversation history for tweet ${tweet.id}: ${error.message}`);
             }
 
             if (tweet.inReplyToStatusId) {
@@ -232,7 +252,7 @@ export class TwitterIntegration {
                         });
                     }
                 } catch (error) {
-                    elizaLogger.error(`Failed to get parent tweet ${tweet.inReplyToStatusId}:`, error);
+                    elizaLogger.error(`Failed to get parent tweet ${tweet.inReplyToStatusId}: ${error.message}`);
                 }
             }
 
@@ -242,7 +262,7 @@ export class TwitterIntegration {
             elizaLogger.info(`Built conversation context for tweet ${tweet.id} in ${(performance.now() - startTime).toFixed(2)}ms`);
             return conversationContext;
         } catch (error) {
-            elizaLogger.error(`Error building conversation context for tweet ${tweet.id}:`, error);
+            elizaLogger.error(`Error building conversation context for tweet ${tweet.id}: ${error.message}`);
             return `@${tweet.username}: ${tweet.text}`;
         }
     }
@@ -265,7 +285,7 @@ export class TwitterIntegration {
                 return buffer;
             } catch (error) {
                 retryCount++;
-                elizaLogger.error(`Failed to generate image (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+                elizaLogger.error(`Failed to generate image (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
                 if (retryCount < MAX_RETRIES) {
                     const backoffTime = 2000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
@@ -301,7 +321,7 @@ export class TwitterIntegration {
                 return imageUrl;
             } catch (error) {
                 retryCount++;
-                elizaLogger.error(`Failed to post image tweet (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+                elizaLogger.error(`Failed to post image tweet (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
                 if (retryCount < MAX_RETRIES) {
                     const backoffTime = 2000 * Math.pow(2, retryCount);
                     elizaLogger.info(`Retrying in ${backoffTime}ms`);
@@ -355,7 +375,7 @@ export class TwitterIntegration {
                     prompt
                 });
             } catch (error) {
-                elizaLogger.error(`Failed to store image history for tweet ${tweet.id}:`, error);
+                elizaLogger.error(`Failed to store image history for tweet ${tweet.id}: ${error.message}`);
             }
 
             const state: State = {
@@ -372,7 +392,7 @@ export class TwitterIntegration {
             try {
                 await this.runtime.processActions(memory, [], state);
             } catch (error) {
-                elizaLogger.error(`Failed to process actions for image request:`, error);
+                elizaLogger.error(`Failed to process actions for image request: ${error.message}`);
                 throw new Error(`Action processing failed: ${error.message}`);
             }
 
@@ -382,7 +402,7 @@ export class TwitterIntegration {
             this.imageConversations.set(cacheKey, { lastPrompt: prompt, lastImageUrl: imageUrl });
             elizaLogger.info(`Successfully generated and shared image for prompt: ${prompt}`);
         } catch (error) {
-            elizaLogger.error(`Error handling image request for tweet ${tweet.id}:`, error);
+            elizaLogger.error(`Error handling image request for tweet ${tweet.id}: ${error.message}`);
             throw error;
         }
     }
@@ -476,7 +496,7 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
                     };
                 }
             } catch (error) {
-                elizaLogger.error('Failed to parse intent analysis:', error);
+                elizaLogger.error(`Failed to parse intent analysis for tweet ${tweet.id}: ${error.message}`);
                 const lowerText = cleanText.toLowerCase();
                 intent = {
                     shouldGenerateImage: lowerText.includes('image') || lowerText.includes('generate') || lowerText.includes('create'),
@@ -511,6 +531,7 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
                         break;
                     } catch (error) {
                         retryCount++;
+                        elizaLogger.error(`Failed to build image prompt for tweet ${tweet.id} (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
                         if (retryCount === MAX_RETRIES) {
                             return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false, reasoning: 'Failed to generate valid image prompt' };
                         }
@@ -520,8 +541,8 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
 
             return { ...intent, prompt };
         } catch (error) {
-            elizaLogger.error('Error analyzing tweet intent:', error);
-            return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false };
+            elizaLogger.error(`Error analyzing tweet intent for tweet ${tweet.id}: ${error.message}`);
+            return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false, reasoning: 'Error in intent analysis' };
         }
     }
 
@@ -532,7 +553,7 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
             try {
                 historyResults = await this.searchRAG(historyQuery, 3);
             } catch (error) {
-                elizaLogger.warn(`Failed to fetch RAG history for tweet ${tweet.id}:`, error);
+                elizaLogger.warn(`Failed to fetch RAG history for tweet ${tweet.id}: ${error.message}`);
             }
 
             const promptContext = `Generate a biblically appropriate image prompt based on this request: "${text}"
@@ -578,7 +599,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             elizaLogger.info(`Generated image prompt for tweet ${tweet.id}: ${finalPrompt}`);
             return finalPrompt;
         } catch (error) {
-            elizaLogger.error(`Error building image prompt for tweet ${tweet.id}:`, error);
+            elizaLogger.error(`Error building image prompt for tweet ${tweet.id}: ${error.message}`);
             return null;
         }
     }
@@ -618,7 +639,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
             elizaLogger.info(`Found ${anyTweetCount} any tweets`);
         } catch (error) {
-            elizaLogger.error('Error in testSearchFunctionality:', error);
+            elizaLogger.error(`Error in testSearchFunctionality: ${error.message}`);
         }
     }
 
@@ -670,7 +691,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                     break;
                 } catch (error) {
                     retryCount++;
-                    elizaLogger.error(`Search attempt ${retryCount} failed: ${error.message}`, error);
+                    elizaLogger.error(`Search attempt ${retryCount} failed: ${error.message}`);
                     if (retryCount < MAX_RETRIES) {
                         const backoffTime = 2000 * Math.pow(2, retryCount);
                         elizaLogger.info(`Retrying search in ${backoffTime}ms`);
@@ -749,7 +770,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                             await this.handleImageRequest(tweet, intent.prompt);
                             success = true;
                         } catch (error) {
-                            elizaLogger.error(`Failed to generate image for tweet ${tweet.id}:`, error);
+                            elizaLogger.error(`Failed to generate image for tweet ${tweet.id}: ${error.message}`);
                             const fallbackResponse = await this.generateResponse(tweet, cleanText, { ...intent, shouldGenerateImage: false });
                             if (fallbackResponse) {
                                 await this.replyToTweet(tweet.id, fallbackResponse);
@@ -766,15 +787,16 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
 
                     if (success) {
                         await this.markTweetAsProcessed(tweet.id);
-                        this.conversationHistory.delete(`from:${tweet.username} OR conversation:${tweet.conversationId}`);
+                        this.conversationHistory.delete(`from:${tweet.username} conversation:${tweet.conversationId}`);
                         mentionsCount++;
                     } else {
                         elizaLogger.warn(`Failed to process tweet ${tweet.id}, not marking as processed`);
+                        this.processedTweetIds.delete(tweet.id); // Remove from cache to allow retry
                     }
 
                     elizaLogger.info(`Processed tweet ${tweet.id} in ${(performance.now() - tweetStart).toFixed(2)}ms`);
                 } catch (error) {
-                    elizaLogger.error(`Error processing tweet ${tweet.id}:`, error);
+                    elizaLogger.error(`Error processing tweet ${tweet.id}: ${error.message}`);
                 }
             };
 
@@ -790,7 +812,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 elizaLogger.info(`Processed ${mentionsCount} mentions, last tweet ID: ${lastTweetId}`);
             }
         } catch (error) {
-            elizaLogger.error('Error in pollMentions:', error);
+            elizaLogger.error(`Error in pollMentions: ${error.message}`);
             if (error.message?.includes('Unauthorized')) {
                 elizaLogger.error('Authentication error, re-initializing scraper...');
                 await this.initializeScraper();
@@ -825,7 +847,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 return false;
             } catch (error) {
                 retryCount++;
-                elizaLogger.error(`Error verifying reply for tweet ${tweetId} (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+                elizaLogger.error(`Error verifying reply for tweet ${tweetId} (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
                 if (retryCount < MAX_RETRIES) {
                     const backoffTime = 2000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
@@ -867,7 +889,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
 
             elizaLogger.info(`Posted reply to tweet ${tweetId}: ${replyContent}`);
         } catch (error) {
-            elizaLogger.error(`Error posting reply to ${tweetId}: ${error.message}`, error);
+            elizaLogger.error(`Error posting reply to ${tweetId}: ${error.message}`);
             throw error;
         }
     }
@@ -888,7 +910,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
 
             elizaLogger.info(`Successfully posted tweet: ${content}`);
         } catch (error) {
-            elizaLogger.error(`Error posting tweet: ${error.message}`, error);
+            elizaLogger.error(`Error posting tweet: ${error.message}`);
             throw error;
         }
     }
@@ -901,7 +923,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
             return await this.scraper.searchTweets(query, 10, SearchMode.Latest);
         } catch (error) {
-            elizaLogger.error(`Error searching tweets for query "${query}": ${error.message}`, error);
+            elizaLogger.error(`Error searching tweets for query "${query}": ${error.message}`);
             throw error;
         }
     }
@@ -914,13 +936,13 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
             return await this.scraper.searchTweets(`from:${process.env.TWITTER_USERNAME!}`, 10, SearchMode.Latest);
         } catch (error) {
-            elizaLogger.error('Error fetching timeline:', error);
+            elizaLogger.error(`Error fetching timeline: ${error.message}`);
             throw error;
         }
     }
 
     private async startPeriodicPosting(): Promise<void> {
-        const POST_INTERVAL = 900000; // 15min
+        const POST_INTERVAL = 900000;
         const MAX_RETRIES = 3;
 
         elizaLogger.info(`Starting periodic posting every ${POST_INTERVAL / 1000} seconds`);
@@ -971,7 +993,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                         break;
                     } catch (error) {
                         retryCount++;
-                        elizaLogger.error(`Failed to post periodic tweet (${retryCount}/${MAX_RETRIES}): ${error.message}`, error);
+                        elizaLogger.error(`Failed to post periodic tweet (${retryCount}/${MAX_RETRIES}): ${error.message}`);
                         if (retryCount < MAX_RETRIES) {
                             const backoffTime = 2000 * Math.pow(2, retryCount);
                             elizaLogger.info(`Retrying in ${backoffTime}ms`);
@@ -982,7 +1004,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                     }
                 }
             } catch (error) {
-                elizaLogger.error('Error in periodic posting:', error);
+                elizaLogger.error(`Error in periodic posting: ${error.message}`);
             } finally {
                 this.isPosting = false;
             }
@@ -996,7 +1018,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                     try {
                         await generateAndPostTweet();
                     } catch (error) {
-                        elizaLogger.error('Error in scheduled periodic post:', error);
+                        elizaLogger.error(`Error in scheduled periodic post: ${error.message}`);
                     } finally {
                         scheduleNextPost();
                     }
@@ -1005,7 +1027,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
 
             scheduleNextPost();
         } catch (error) {
-            elizaLogger.error('Failed to start periodic posting:', error);
+            elizaLogger.error(`Failed to start periodic posting: ${error.message}`);
         }
     }
 
@@ -1049,7 +1071,7 @@ Keep the response under 280 characters. No hashtags or emojis. Ensure the reply 
             }
             return null;
         } catch (error) {
-            elizaLogger.error('Error generating response:', error);
+            elizaLogger.error(`Error generating response for tweet ${tweet.id}: ${error.message}`);
             return null;
         }
     }
@@ -1063,48 +1085,63 @@ Keep the response under 280 characters. No hashtags or emojis. Ensure the reply 
             await this.scraper.login(username, password, email);
             elizaLogger.info('Successfully re-initialized Twitter scraper');
         } catch (error) {
-            elizaLogger.error('Failed to re-initialize Twitter scraper:', error);
+            elizaLogger.error(`Failed to re-initialize Twitter scraper: ${error.message}`);
             throw error;
         }
     }
 
     private async storeInRAG(content: string, metadata: any): Promise<void> {
-        let retryCount = 0;
-        const MAX_RETRIES = 3;
-        while (retryCount < MAX_RETRIES) {
-            try {
-                await this.runtime.rag.store({
-                    id: stringToUuid(Date.now().toString()),
-                    content,
-                    metadata
-                });
-                elizaLogger.info(`Stored in RAG: ${content.slice(0, 50)}...`);
-                return;
-            } catch (error) {
-                retryCount++;
-                if (error.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-                    elizaLogger.warn(`Duplicate RAG entry detected, skipping: ${error.message}`);
-                    return;
-                }
-                if (error.message.includes('embedding')) {
-                    elizaLogger.warn(`Embedding failure for content: ${content.slice(0, 50)}...`);
-                }
-                if (retryCount < MAX_RETRIES) {
-                    const backoffTime = 1000 * Math.pow(2, retryCount);
-                    elizaLogger.warn(`RAG store failed (attempt ${retryCount}/${MAX_RETRIES}), retrying in ${backoffTime}ms`);
-                    await new Promise(resolve => setTimeout(resolve, backoffTime));
-                } else {
-                    elizaLogger.error(`RAG store failed after ${MAX_RETRIES} attempts: ${error.message}`);
-                    await this.database.storeConversationHistory({
-                        conversationId: metadata.conversationId,
-                        tweetId: metadata.tweetId,
-                        username: metadata.username || 'unknown',
-                        content,
-                        timestamp: metadata.timestamp,
-                        type: metadata.type
-                    });
-                }
+        try {
+            elizaLogger.info(`[RAG] Generating embedding for content: ${content.slice(0, 100)}...`);
+            elizaLogger.info(`[RAG] Content length: ${content.length} characters`);
+            elizaLogger.info(`[RAG] Metadata: ${JSON.stringify(metadata)}`);
+            
+            const startTime = performance.now();
+            const embedding = await embed(this.runtime, content);
+            const duration = performance.now() - startTime;
+            
+            elizaLogger.info(`[RAG] Embedding generation took ${duration.toFixed(2)}ms`);
+            elizaLogger.info(`[RAG] Generated embedding: ${embedding ? `Array(${embedding.length})` : 'null'}`);
+            
+            if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+                throw new Error('Failed to generate valid embedding');
             }
+
+            elizaLogger.info(`[RAG] Converting embedding to buffer...`);
+            const embeddingBuffer = Buffer.from(embedding);
+            elizaLogger.info(`[RAG] Buffer size: ${embeddingBuffer.length} bytes`);
+            elizaLogger.info(`[RAG] First few values: ${embedding.slice(0, 5).join(', ')}...`);
+
+            const id = stringToUuid(Date.now().toString());
+            elizaLogger.info(`[RAG] Storing in RAG with ID: ${id}`);
+            
+            await this.runtime.rag.store({
+                id,
+                content,
+                metadata,
+                embedding: embeddingBuffer
+            });
+            
+            elizaLogger.info(`[RAG] Successfully stored in RAG: ${content.slice(0, 50)}...`);
+        } catch (error) {
+            elizaLogger.error(`[RAG] Failed to store in RAG:`, {
+                error: error.message,
+                stack: error.stack,
+                code: error.code,
+                name: error.name,
+                content: content.slice(0, 100),
+                metadata: JSON.stringify(metadata)
+            });
+            
+            // Store in conversation history as fallback
+            await this.database.storeConversationHistory({
+                conversationId: metadata.conversationId,
+                tweetId: metadata.tweetId,
+                username: metadata.username || 'unknown',
+                content,
+                timestamp: metadata.timestamp,
+                type: metadata.type
+            });
         }
     }
 
@@ -1123,8 +1160,8 @@ Keep the response under 280 characters. No hashtags or emojis. Ensure the reply 
                     const backoffTime = 1000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
                 } else {
-                    const conversationId = query.includes('conversation:') ? query.replace('conversation:', '') : '';
-                    const username = query.includes('from:') ? query.split(' OR ')[0].replace('from:', '') : '';
+                    const conversationId = query.includes('conversation:') ? query.replace(/.*conversation:([^ ]+).*/, '$1') : '';
+                    const username = query.includes('from:') ? query.replace(/from:([^ ]+).*/, '$1') : '';
                     return await this.database.getConversationHistory(conversationId, username);
                 }
             }
