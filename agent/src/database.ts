@@ -2,129 +2,134 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { elizaLogger } from '@elizaos/core';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+interface ConversationHistory {
+    conversationId: string;
+    tweetId: string;
+    username: string;
+    content: string;
+    timestamp: number;
+    type: 'tweet' | 'parent_tweet' | 'image_generation';
+}
+
 export class Database {
     private db: any;
-    private dbPath: string;
-
-    constructor(dbPath?: string) {
-        this.dbPath = dbPath || path.join(__dirname, '../data/tweets.db');
-    }
 
     async initialize() {
-        this.db = await open({
-            filename: this.dbPath,
-            driver: sqlite3.Database
-        });
-
-        await this.db.exec(`
-            CREATE TABLE IF NOT EXISTS replied_tweets (
-                tweet_id TEXT PRIMARY KEY,
-                replied_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tweet_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                username TEXT NOT NULL,
-                message TEXT NOT NULL,
-                response TEXT,
-                created_at INTEGER NOT NULL,
-                replied_at INTEGER
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_conversations_tweet_id ON conversations(tweet_id);
-            CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
-        `);
-    }
-
-    async runTransaction<T>(callback: () => Promise<T>): Promise<T> {
         try {
-            await this.db.run('BEGIN TRANSACTION');
-            const result = await callback();
-            await this.db.run('COMMIT');
-            return result;
+            this.db = await open({
+                filename: path.join(__dirname, '../data/tweets.db'),
+                driver: sqlite3.Database
+            });
+
+            await this.db.exec(`
+                CREATE TABLE IF NOT EXISTS replied_tweets (
+                    tweet_id TEXT PRIMARY KEY,
+                    replied_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    tweet_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    type TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_conversation_id ON conversation_history (conversation_id);
+            `);
+            elizaLogger.info('Database initialized successfully');
         } catch (error) {
-            await this.db.run('ROLLBACK');
+            elizaLogger.error('Error initializing database:', error);
             throw error;
         }
     }
 
     async isTweetReplied(tweetId: string): Promise<boolean> {
-        const result = await this.db.get(
-            'SELECT tweet_id FROM replied_tweets WHERE tweet_id = ?',
-            [tweetId]
-        );
-        return !!result;
+        try {
+            const result = await this.db.get('SELECT tweet_id FROM replied_tweets WHERE tweet_id = ?', [tweetId]);
+            return !!result;
+        } catch (error) {
+            elizaLogger.error(`Error checking if tweet ${tweetId}: is replied:`, error);
+            throw error;
+        }
     }
 
     async markTweetAsReplied(tweetId: string): Promise<void> {
-        await this.db.run(
-            'INSERT OR REPLACE INTO replied_tweets (tweet_id, replied_at, created_at) VALUES (?, ?, ?)',
-            [tweetId, Date.now(), Date.now()]
-        );
+        try {
+            await this.db.run(
+                'INSERT OR REPLACE INTO replied_tweets (tweet_id, replied_at, created_at) VALUES (?, ?, ?)',
+                [tweetId, Date.now(), Date.now()]);
+            elizaLogger.info(`Marked tweet ${tweetId} as replied`);
+        } catch (error) {
+            elizaLogger.error(`Error marking tweet ${tweetId} as replied:`, error);
+            throw error;
+        }
+    }
+
+    async storeConversationHistory(history: ConversationHistory): Promise<void> {
+        try {
+            await this.db.run(
+                `INSERT INTO conversation_history (conversation_id, tweet_id, username, content, timestamp, type) VALUES (?, ?, ?, ?, ?, ?)`,
+                [history.conversationId, history.tweetId, history.username, history.content, history.timestamp, history.type]);
+            elizaLogger.info(`Stored conversation history for ${history.tweetId}}`);
+        } catch (error) {
+            elizaLogger.error(`Error storing conversation history for tweet ${history.tweetId}:`, error);
+            throw error;
+        }
+    }
+
+    async getConversationHistory(conversationId: string): Promise<Array<{ content: string; metadata: any }>> {
+        try {
+            const results = await this.db.all(
+                'SELECT content, conversation_id, tweet_id, username, timestamp, type FROM conversation_history WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 5',
+                [conversationId]
+            );
+
+            return results.map(row => ({
+                content: row.content,
+                metadata: {
+                    conversationId: row.conversation_id,
+                    tweetId: row.tweet_id,
+                    username: row.conversation,
+                    timestamp: row.content,
+                    type: row.content
+                }
+            }));
+        } catch (error) {
+            elizaLogger.error(`Error getting conversation history for conversation ${conversationId}}`, error);
+            throw error;
+        }
     }
 
     async cleanupOldTweets(maxAge: number = 30 * 24 * 60 * 60 * 1000): Promise<void> {
-        const cutoffTime = Date.now() - maxAge;
-        await this.db.run(
-            'DELETE FROM replied_tweets WHERE created_at < ?',
-            [cutoffTime]
-        );
+        try {
+            const cutoffTime = Date.now() - maxAge;
+            await this.db.run('DELETE FROM replied_tweets WHERE created_at < ?', [cutoffTime]);
+            await this.db.run('DELETE FROM conversation_history WHERE timestamp < ?', [cutoffTime]);
+            elizaLogger.info('Cleaned up old tweets and conversation history');
+        } catch (error) {
+            elizaLogger.error('Error cleaning up old tweets:', error);
+            throw error;
+        }
     }
 
-    async close(): Promise<void> {
-        if (this.db) await this.db.close();
-    }
-
-    async run(sql: string, params?: any[]): Promise<any> {
-        return params ? this.db.run(sql, params) : this.db.run(sql);
-    }
-
-    async all(sql: string, params?: any[]): Promise<any[]> {
-        return params ? this.db.all(sql, params) : this.db.all(sql);
-    }
-
-    async exec(sql: string): Promise<any> {
-        return this.db.exec(sql);
-    }
-
-    async storeConversation(tweetId: string, userId: string, username: string, message: string, response: string | null = null): Promise<void> {
-        const now = Date.now();
-        await this.db.run(
-            `INSERT INTO conversations (tweet_id, user_id, username, message, response, created_at, replied_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [tweetId, userId, username, message, response, now, response ? now : null]
-        );
-    }
-
-    async getConversationHistory(tweetId: string, limit: number = 10): Promise<Array<{
-        message: string;
-        response: string | null;
-        created_at: number;
-    }>> {
-        return await this.db.all(
-            `SELECT message, response, created_at 
-             FROM conversations 
-             WHERE tweet_id = ? 
-             ORDER BY created_at DESC 
-             LIMIT ?`,
-            [tweetId, limit]
-        );
-    }
-
-    async updateConversationResponse(tweetId: string, response: string): Promise<void> {
-        const now = Date.now();
-        await this.db.run(
-            `UPDATE conversations 
-             SET response = ?, replied_at = ? 
-             WHERE tweet_id = ? AND response IS NULL`,
-            [response, now, tweetId]
-        );
+    async cleanup(): Promise<void> {
+        try {
+            if (this.db) {
+                await this.db.close();
+                elizaLogger.info('Database closed successfully');
+            }
+        } catch (error) {
+            elizaLogger.error('Error closing database:', error);
+            throw error;
+        }
     }
 }

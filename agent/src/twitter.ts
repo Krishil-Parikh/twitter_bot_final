@@ -1,5 +1,5 @@
 import { type IAgentRuntime, elizaLogger, type Memory, type State, stringToUuid, generateText, ModelClass, composeContext, AgentRuntime } from '@elizaos/core';
-import { Scraper, SearchMode, Tweet as TwitterClientTweet } from 'agent-twitter-client';
+import { Scraper, SearchMode, Tweet } from 'agent-twitter-client';
 import { Database } from './database';
 
 interface IRAG {
@@ -19,48 +19,33 @@ interface TweetIntent {
     reasoning?: string;
 }
 
-interface Tweet {
-    id: string;
-    text: string;
-    username: string;
-    authorId?: string;
-    inReplyToStatusId?: string;
-}
-
 export class TwitterIntegration {
     private scraper: Scraper;
     private runtime: IAgentRuntimeWithRAG;
     private isInitialized: boolean = false;
     private pollInterval: NodeJS.Timeout | null = null;
     private isProcessing: boolean = false;
-    private conversationHistory: Map<string, string[]> = new Map();
-    private imageConversations: Map<string, { lastPrompt: string, lastImageUrl: string }> = new Map();
-    private db: Database;
-    private isLoaded: boolean = false;
-    private lastPollTime: number = 0;
-    private lastTweetId: string | null = null;
-    private isGeneratingTweet: boolean = false;
-    private lastPostTime: number = 0;
-    private postInterval: number = 60 * 1000; // 60 seconds
-    private postTimer: NodeJS.Timeout | null = null;
+    private isPosting: boolean = false;
+    private conversationHistory: Map<string, Array<{ content: string; metadata: any }>> = new Map();
+    private imageConversations: Map<string, { lastPrompt: string; lastImageUrl: string }> = new Map();
+    private database: Database;
 
-    // Add public getter for initialization status
     get initialized(): boolean {
         return this.isInitialized;
     }
 
-    constructor(runtime: IAgentRuntimeWithRAG, db: Database) {
+    constructor(runtime: IAgentRuntimeWithRAG) {
         this.runtime = runtime;
-        this.db = db;
         this.scraper = new Scraper();
+        this.database = new Database();
     }
 
     private async isTweetProcessed(tweetId: string): Promise<boolean> {
         try {
-            return await this.db.isTweetReplied(tweetId);
+            return await this.database.isTweetReplied(tweetId);
         } catch (error) {
             elizaLogger.error(`Error checking if tweet ${tweetId} is processed:`, error);
-            return false; // Assume not processed if check fails
+            return false;
         }
     }
 
@@ -69,7 +54,7 @@ export class TwitterIntegration {
         const MAX_RETRIES = 3;
         while (retryCount < MAX_RETRIES) {
             try {
-                await this.db.markTweetAsReplied(tweetId);
+                await this.database.markTweetAsReplied(tweetId);
                 elizaLogger.info(`Marked tweet ${tweetId} as processed`);
                 return;
             } catch (error) {
@@ -79,49 +64,31 @@ export class TwitterIntegration {
                     const backoffTime = 1000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
                 } else {
-                    throw new Error(`Failed to mark tweet ${tweetId} as processed after ${MAX_RETRIES} attempts`);
+                    elizaLogger.error(`Failed to mark tweet ${tweetId} as processed after ${MAX_RETRIES} attempts`);
                 }
             }
         }
     }
 
     async initialize(): Promise<void> {
-        if (this.isInitialized) {
-            return;
-        }
+        if (this.isInitialized) return;
 
         try {
-            // Initialize database
-            await this.db.initialize();
-
-            // Check for required environment variables
-            const requiredEnvVars = [
-                'TWITTER_USERNAME',
-                'TWITTER_PASSWORD',
-                'TWITTER_EMAIL'
-            ];
-
+            await this.database.initialize();
+            const requiredEnvVars = ['TWITTER_USERNAME', 'TWITTER_PASSWORD', 'TWITTER_EMAIL'];
             for (const envVar of requiredEnvVars) {
-                if (!process.env[envVar]) {
-                    throw new Error(`Missing required environment variable: ${envVar}`);
-                }
+                if (!process.env[envVar]) throw new Error(`Missing required environment variable: ${envVar}`);
             }
 
             elizaLogger.info('Attempting to login to Twitter...');
-            elizaLogger.info(`Using credentials for username: ${process.env.TWITTER_USERNAME}`);
-
-            // Login to Twitter with retry logic and timeout
             let loginSuccess = false;
             let retryCount = 0;
             const MAX_RETRIES = 3;
-            const LOGIN_TIMEOUT = 15000; // 15 seconds
+            const LOGIN_TIMEOUT = 15000;
 
             while (!loginSuccess && retryCount < MAX_RETRIES) {
                 try {
-                    const timeoutPromise = new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error('Login timeout')), LOGIN_TIMEOUT);
-                    });
-
+                    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Login timeout')), LOGIN_TIMEOUT));
                     await Promise.race([
                         this.scraper.login(
                             process.env.TWITTER_USERNAME!,
@@ -132,19 +99,14 @@ export class TwitterIntegration {
                         timeoutPromise
                     ]);
 
-                    const isLoggedIn = await this.scraper.isLoggedIn();
-                    if (!isLoggedIn) {
-                        throw new Error('Login verification failed - isLoggedIn check returned false');
-                    }
-
+                    if (!await this.scraper.isLoggedIn()) throw new Error('Login verification failed');
                     loginSuccess = true;
                     elizaLogger.info('Successfully logged in to Twitter');
                 } catch (error) {
                     retryCount++;
                     elizaLogger.error(`Login attempt ${retryCount} failed:`, error);
                     if (retryCount < MAX_RETRIES) {
-                        const backoffTime = Math.min(1000 * Math.pow(2, retryCount), 5000);
-                        elizaLogger.info(`Retrying login in ${backoffTime}ms...`);
+                        const backoffTime = 2000 * Math.pow(2, retryCount);
                         await new Promise(resolve => setTimeout(resolve, backoffTime));
                     } else {
                         throw new Error(`Failed to login after ${MAX_RETRIES} attempts: ${error.message}`);
@@ -152,12 +114,8 @@ export class TwitterIntegration {
                 }
             }
 
-            // Start polling for mentions
             await this.startPolling();
-
-            // Start periodic posting
             await this.startPeriodicPosting();
-
             this.isInitialized = true;
         } catch (error) {
             await this.handleError(error, 'initialization');
@@ -170,17 +128,17 @@ export class TwitterIntegration {
     }
 
     private async startPolling(): Promise<void> {
-        let lastCycleDuration = 120000; // Initial duration (120 seconds)
-        const MIN_INTERVAL = 60000; // 30 seconds
-        const MAX_INTERVAL = 300000; // 300 seconds
-        const CYCLE_TIMEOUT = 600000; // 10 minutes
-    
+        let lastCycleDuration = 60000;
+        const MIN_INTERVAL = 60000;
+        const MAX_INTERVAL = 180000;
+        const CYCLE_TIMEOUT = 300000;
+
         const pollWithTimeout = async () => {
             const timeoutPromise = setTimeout(() => {
                 elizaLogger.warn('Polling cycle timed out, forcing reset');
                 this.isProcessing = false;
             }, CYCLE_TIMEOUT);
-    
+
             const startTime = performance.now();
             try {
                 await this.pollMentions();
@@ -190,128 +148,114 @@ export class TwitterIntegration {
                 clearTimeout(timeoutPromise);
                 this.isProcessing = false;
                 const duration = performance.now() - startTime;
-                lastCycleDuration = Math.min(Math.max(duration * 1.5, MIN_INTERVAL), MAX_INTERVAL);
+                lastCycleDuration = Math.min(Math.max(duration * 1.2, MIN_INTERVAL), MAX_INTERVAL);
                 elizaLogger.info(`Polling cycle took ${duration.toFixed(2)}ms, next in ${lastCycleDuration}ms`);
             }
         };
-    
-        // Initial poll after  after a timeout
-        setTimeout(async () => {
-            await pollWithTimeout();
-        }, 5000);
-    
-        // Schedule periodic polling
+
+        setTimeout(pollWithTimeout, 5000);
+
         const scheduleNextPoll = () => {
             this.pollInterval = setTimeout(async () => {
-                if (!this.isProcessing) {
-                    await pollWithTimeout();
-                } else {
-                    elizaLogger.info('Skipping poll cycle - previous cycle still in progress');
-                }
+                if (!this.isProcessing) await pollWithTimeout();
+                else elizaLogger.info('Skipping poll cycle - previous cycle in progress');
                 scheduleNextPoll();
             }, lastCycleDuration);
         };
-    
+
         elizaLogger.info(`Started polling with dynamic interval (~${lastCycleDuration}ms)`);
         scheduleNextPoll();
     }
 
     private async buildConversationContext(tweet: any, conversationId: string): Promise<string> {
+        const startTime = performance.now();
         try {
+            if (!tweet.inReplyToStatusId) {
+                elizaLogger.info(`No reply context for tweet ${tweet.id}, skipping RAG`);
+                return tweet.text;
+            }
+
             const historyQuery = `conversation:${conversationId}`;
             let historyResults: Array<{ content: string; metadata: any }> = [];
-            
-            // Retry RAG search
-            let searchRetryCount = 0;
-            const MAX_RETRIES = 3;
-            while (searchRetryCount < MAX_RETRIES) {
+
+            if (this.conversationHistory.has(historyQuery)) {
+                elizaLogger.info(`Using cached history for conversation ${conversationId}`);
+                historyResults = this.conversationHistory.get(historyQuery)!;
+            } else {
                 try {
+                    const searchStart = performance.now();
                     historyResults = await this.runtime.rag.search(historyQuery, 5);
-                    break;
+                    elizaLogger.info(`RAG search took ${(performance.now() - searchStart).toFixed(2)}ms`);
+                    this.conversationHistory.set(historyQuery, historyResults);
                 } catch (error) {
-                    searchRetryCount++;
-                    elizaLogger.error(`Failed to search RAG (attempt ${searchRetryCount}/${MAX_RETRIES}):`, error);
-                    if (searchRetryCount < MAX_RETRIES) {
-                        const backoffTime = 1000 * Math.pow(2, searchRetryCount);
-                        await new Promise(resolve => setTimeout(resolve, backoffTime));
-                    } else {
-                        elizaLogger.warn(`RAG search failed after retries, proceeding without history`);
-                        historyResults = [];
-                    }
+                    elizaLogger.error(`Failed to search RAG for tweet ${tweet.id}:`, error);
+                    historyResults = await this.database.getConversationHistory(conversationId);
+                    this.conversationHistory.set(historyQuery, historyResults);
                 }
             }
-    
+
             const tweetText = `@${tweet.username}: ${tweet.text}`;
-    
-            // Store tweet in RAG with retry
-            let storeRetryCount = 0;
-            while (storeRetryCount < MAX_RETRIES) {
+
+            try {
+                await this.database.storeConversationHistory({
+                    conversationId,
+                    tweetId: tweet.id,
+                    username: tweet.username,
+                    content: tweetText,
+                    timestamp: Date.now(),
+                    type: 'tweet'
+                });
+
                 try {
+                    const storeStart = performance.now();
                     await this.runtime.rag.store({
                         id: stringToUuid(Date.now().toString()),
                         content: tweetText,
-                        metadata: {
-                            conversationId,
-                            timestamp: Date.now(),
-                            username: tweet.username,
-                            tweetId: tweet.id,
-                            type: 'tweet'
-                        }
+                        metadata: { conversationId, timestamp: Date.now(), username: tweet.username, tweetId: tweet.id, type: 'tweet' }
                     });
-                    break;
+                    elizaLogger.info(`RAG store took ${(performance.now() - storeStart).toFixed(2)}ms`);
                 } catch (error) {
-                    storeRetryCount++;
-                    elizaLogger.error(`Failed to store tweet in RAG (attempt ${storeRetryCount}/${MAX_RETRIES}):`, error);
-                    if (storeRetryCount < MAX_RETRIES) {
-                        const backoffTime = 1000 * Math.pow(2, storeRetryCount);
-                        await new Promise(resolve => setTimeout(resolve, backoffTime));
-                    } else {
-                        elizaLogger.warn(`RAG store failed after retries, proceeding without storage`);
-                    }
+                    elizaLogger.warn(`Failed to store tweet in RAG for tweet ${tweet.id}:`, error);
                 }
+            } catch (error) {
+                elizaLogger.error(`Failed to store conversation history in database for tweet ${tweet.id}:`, error);
             }
-    
+
             if (tweet.inReplyToStatusId) {
                 try {
                     const parentTweet = await this.scraper.getTweet(tweet.inReplyToStatusId);
                     if (parentTweet) {
                         const parentText = `@${parentTweet.username}: ${parentTweet.text}`;
-                        let parentStoreRetryCount = 0;
-                        while (parentStoreRetryCount < MAX_RETRIES) {
+                        try {
+                            await this.database.storeConversationHistory({
+                                conversationId,
+                                tweetId: parentTweet.id,
+                                username: parentTweet.username,
+                                content: parentText,
+                                timestamp: Date.now(),
+                                type: 'parent_tweet'
+                            });
+
                             try {
                                 await this.runtime.rag.store({
-                                    id: stringToUuid(tweet.inReplyToStatusId),
+                                    id: stringToUuid(parentTweet.id),
                                     content: parentText,
-                                    metadata: {
-                                        conversationId,
-                                        timestamp: Date.now(),
-                                        username: parentTweet.username,
-                                        tweetId: tweet.inReplyToStatusId,
-                                        type: 'parent_tweet'
-                                    }
+                                    metadata: { conversationId, timestamp: Date.now(), username: parentTweet.username, tweetId: parentTweet.id, type: 'parent_tweet' }
                                 });
-                                break;
                             } catch (error) {
-                                parentStoreRetryCount++;
-                                elizaLogger.error(`Failed to store parent tweet in RAG (attempt ${parentStoreRetryCount}/${MAX_RETRIES}):`, error);
-                                if (parentStoreRetryCount < MAX_RETRIES) {
-                                    const backoffTime = 1000 * Math.pow(2, parentStoreRetryCount);
-                                    await new Promise(resolve => setTimeout(resolve, backoffTime));
-                                } else {
-                                    elizaLogger.warn(`RAG store for parent tweet failed after retries`);
-                                }
+                                elizaLogger.warn(`Failed to store parent tweet in RAG for tweet ${tweet.id}:`, error);
                             }
+                        } catch (error) {
+                            elizaLogger.error(`Failed to store parent conversation history in database for tweet ${tweet.id}:`, error);
                         }
                     }
                 } catch (error) {
                     elizaLogger.error(`Failed to get parent tweet ${tweet.inReplyToStatusId}:`, error);
                 }
             }
-    
-            const conversationContext = historyResults
-                .map(result => result.content)
-                .join('\n\n');
-    
+
+            const conversationContext = historyResults.map(result => result.content).join('\n\n');
+            elizaLogger.info(`Built conversation context for tweet ${tweet.id} in ${(performance.now() - startTime).toFixed(2)}ms`);
             return conversationContext || tweet.text;
         } catch (error) {
             elizaLogger.error(`Error building conversation context for tweet ${tweet.id}:`, error);
@@ -329,9 +273,7 @@ export class TwitterIntegration {
                 const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=2560&height=2049&nologo=true`;
 
                 const response = await fetch(imageUrl);
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch image: ${response.statusText}`);
-                }
+                if (!response.ok) throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
 
                 const arrayBuffer = await response.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
@@ -341,7 +283,7 @@ export class TwitterIntegration {
                 retryCount++;
                 elizaLogger.error(`Failed to generate image (attempt ${retryCount}/${MAX_RETRIES}):`, error);
                 if (retryCount < MAX_RETRIES) {
-                    const backoffTime = 1000 * Math.pow(2, retryCount);
+                    const backoffTime = 2000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
                 } else {
                     throw new Error(`Failed to generate image after ${MAX_RETRIES} attempts: ${error.message}`);
@@ -356,23 +298,29 @@ export class TwitterIntegration {
         const MAX_RETRIES = 3;
         while (retryCount < MAX_RETRIES) {
             try {
+                if (!(await this.scraper.isLoggedIn())) {
+                    elizaLogger.warn('Scraper not authenticated, re-initializing...');
+                    await this.initializeScraper();
+                }
+
                 const mediaData = [{ data: imageBuffer, mediaType: 'image/jpeg' }];
                 const result = await this.scraper.sendTweet(caption, tweetId, mediaData);
                 const body = await result.json();
-    
+
                 if (body.errors) {
-                    const error = body.errors[0];
-                    throw new Error(`Twitter error (${error.code}): ${error.message}`);
+                    throw new Error(`Twitter API error: ${JSON.stringify(body.errors)}`);
                 }
-    
-                const imageUrl = body.data.create_tweet.tweet_results.result.legacy.entities.media[0].media_url_https;
+
+                const imageUrl = body.data?.create_tweet?.tweet_results?.result?.legacy?.entities?.media?.[0]?.media_url_https;
+                if (!imageUrl) throw new Error('No media URL in response');
                 elizaLogger.info(`Posted image tweet for tweet ${tweetId}: ${imageUrl}`);
                 return imageUrl;
             } catch (error) {
                 retryCount++;
                 elizaLogger.error(`Failed to post image tweet (attempt ${retryCount}/${MAX_RETRIES}):`, error);
                 if (retryCount < MAX_RETRIES) {
-                    const backoffTime = 1000 * Math.pow(2, retryCount);
+                    const backoffTime = 2000 * Math.pow(2, retryCount);
+                    elizaLogger.info(`Retrying in ${backoffTime}ms`);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));
                 } else {
                     throw new Error(`Failed to post image tweet after ${MAX_RETRIES} attempts: ${error.message}`);
@@ -381,56 +329,52 @@ export class TwitterIntegration {
         }
         throw new Error('Failed to post image tweet');
     }
-    
+
     private async handleImageRequest(tweet: any, prompt: string): Promise<void> {
         try {
-            // Validate image buffer
-            const imageBuffer = await this.generateImage(prompt);
-            if (!imageBuffer || imageBuffer.length === 0) {
-                throw new Error('Invalid or empty image buffer');
+            const cacheKey = `${tweet.conversationId}:${prompt}`;
+            if (this.imageConversations.has(cacheKey)) {
+                const cached = this.imageConversations.get(cacheKey)!;
+                elizaLogger.info(`Using cached image for prompt: ${prompt}`);
+                await this.postImageTweet(tweet.id, Buffer.from(cached.lastImageUrl, 'base64'), "Here's the image you requested");
+                return;
             }
-    
+
+            const imageBuffer = await this.generateImage(prompt);
+            if (!imageBuffer || imageBuffer.length === 0) throw new Error('Invalid or empty image buffer');
+
             const memory: Memory = {
                 id: stringToUuid(Date.now().toString()),
                 userId: stringToUuid(tweet.userId),
                 agentId: this.runtime.agentId,
                 roomId: stringToUuid(tweet.conversationId),
-                content: {
-                    text: `Generated image for prompt: ${prompt}`,
-                    action: 'GENERATE_IMAGE'
-                },
+                content: { text: `Generated image for prompt: ${prompt}`, action: 'GENERATE_IMAGE' },
                 createdAt: Date.now()
             };
-    
-            // Store in RAG with retry
-            let ragRetryCount = 0;
-            const MAX_RAG_RETRIES = 3;
-            while (ragRetryCount < MAX_RAG_RETRIES) {
+
+            try {
+                await this.database.storeConversationHistory({
+                    conversationId: tweet.conversationId,
+                    tweetId: tweet.id,
+                    username: tweet.username,
+                    content: `Generated image: ${prompt}`,
+                    timestamp: Date.now(),
+                    type: 'image_generation'
+                });
+
                 try {
                     await this.runtime.rag.store({
                         id: memory.id,
                         content: `Generated image: ${prompt}`,
-                        metadata: {
-                            conversationId: tweet.conversationId,
-                            timestamp: Date.now(),
-                            type: 'image_generation',
-                            prompt,
-                            tweetId: tweet.id
-                        }
+                        metadata: { conversationId: tweet.conversationId, timestamp: Date.now(), type: 'image_generation', prompt, tweetId: tweet.id }
                     });
-                    break;
                 } catch (error) {
-                    ragRetryCount++;
-                    elizaLogger.error(`Failed to store image in RAG (attempt ${ragRetryCount}/${MAX_RAG_RETRIES}):`, error);
-                    if (ragRetryCount < MAX_RAG_RETRIES) {
-                        const backoffTime = 1000 * Math.pow(2, ragRetryCount);
-                        await new Promise(resolve => setTimeout(resolve, backoffTime));
-                    } else {
-                        throw new Error(`Failed to store image in RAG: ${error.message}`);
-                    }
+                    elizaLogger.warn(`Failed to store image in RAG for tweet ${tweet.id}:`, error);
                 }
+            } catch (error) {
+                elizaLogger.error(`Failed to store image conversation history in database for tweet ${tweet.id}:`, error);
             }
-    
+
             const state: State = {
                 bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
                 lore: this.runtime.character.lore.join(' '),
@@ -441,34 +385,18 @@ export class TwitterIntegration {
                 recentMessages: `Generate an image for: ${prompt}`,
                 recentMessagesData: [memory]
             };
-    
-            // Process actions with error logging
+
             try {
                 await this.runtime.processActions(memory, [], state);
             } catch (error) {
                 elizaLogger.error(`Failed to process actions for image request:`, error);
                 throw new Error(`Action processing failed: ${error.message}`);
             }
-    
-            // Post image tweet
+
             const caption = "Here's the image you requested";
             const imageUrl = await this.postImageTweet(tweet.id, imageBuffer, caption);
-    
-            // Store image post in RAG
-            await this.runtime.rag.store({
-                id: stringToUuid(Date.now().toString()),
-                content: `Posted image: ${imageUrl} for prompt: ${prompt}`,
-                metadata: {
-                    conversationId: tweet.conversationId,
-                    timestamp: Date.now(),
-                    type: 'image_post',
-                    prompt,
-                    imageUrl,
-                    tweetId: tweet.id
-                }
-            });
-    
-            this.imageConversations.set(tweet.conversationId, { lastPrompt: prompt, lastImageUrl: imageUrl });
+
+            this.imageConversations.set(cacheKey, { lastPrompt: prompt, lastImageUrl: imageUrl });
             elizaLogger.info(`Successfully generated and shared image for prompt: ${prompt}`);
         } catch (error) {
             elizaLogger.error(`Error handling image request for tweet ${tweet.id}:`, error);
@@ -487,36 +415,23 @@ export class TwitterIntegration {
 
     private isInappropriateContent(text: string): boolean {
         const inappropriatePatterns = [
-            /nsfw/i,
-            /explicit/i,
-            /profane/i,
-            /blasphem/i,
-            /fuck/i,
-            /shit/i,
-            /damn/i,
-            /hell/i,
-            /bitch/i,
-            /ass/i,
-            /porn/i,
-            /sex/i,
-            /nude/i,
-            /drug/i,
-            /alcohol/i,
-            /drunk/i,
-            /high/i
+            /\bnsfw\b/i, /\bexplicit\b/i, /\bprofane\b/i, /\bblasphem(y|ous)\b/i,
+            /\bfuck\b/i, /\bshit\b/i, /\bdamn\b/i, /\bhell\b/i, /\bbitch\b/i,
+            /\bass\b/i, /\bporn\b/i, /\bsex\b/i, /\bnude\b/i, /\bdrug\b/i,
+            /\balcohol\b/i, /\bdrunk\b/i, /\bhigh\b/i
         ];
 
-        const whitelist = ['jesus', 'christ', 'god', 'holy', 'spirit', 'bibl']; // Allow biblical terms
+        const whitelist = ['jesus', 'christ', 'god', 'holy', 'spirit', 'bibl', 'hello', 'help', 'healing', 'heaven'];
         const lowerText = text.toLowerCase();
+
         if (whitelist.some(term => lowerText.includes(term))) {
+            elizaLogger.info(`Text whitelisted due to term: ${whitelist.find(term => lowerText.includes(term))}`);
             return false;
         }
 
         const isInappropriate = inappropriatePatterns.some(pattern => {
             const match = pattern.test(lowerText);
-            if (match) {
-                elizaLogger.info(`Text flagged as inappropriate due to pattern: ${pattern}`);
-            }
+            if (match) elizaLogger.info(`Text flagged as inappropriate due to pattern: ${pattern.source}`);
             return match;
         });
 
@@ -527,11 +442,7 @@ export class TwitterIntegration {
         try {
             if (this.isInappropriateContent(cleanText)) {
                 elizaLogger.info(`Skipping inappropriate content in tweet ${tweet.id}`);
-                return {
-                    shouldGenerateImage: false,
-                    shouldReply: false,
-                    isImageEditRequest: false
-                };
+                return { shouldGenerateImage: false, shouldReply: false, isImageEditRequest: false };
             }
 
             const state: State = {
@@ -583,8 +494,6 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
                 }
             } catch (error) {
                 elizaLogger.error('Failed to parse intent analysis:', error);
-                elizaLogger.info('Raw intent analysis:', intentAnalysis);
-
                 const lowerText = cleanText.toLowerCase();
                 intent = {
                     shouldGenerateImage: lowerText.includes('image') || lowerText.includes('generate') || lowerText.includes('create'),
@@ -593,8 +502,6 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
                     reasoning: 'Fallback to keyword analysis'
                 };
             }
-
-            elizaLogger.info(`Intent analysis for tweet ${tweet.id}:`, intent);
 
             let prompt: string | undefined;
             if (intent.shouldGenerateImage) {
@@ -613,47 +520,25 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
 
                         if (!prompt) {
                             retryCount++;
-                            elizaLogger.warn(`Failed to generate prompt for tweet ${tweet.id}, retrying (${retryCount}/${MAX_RETRIES})`);
                             if (retryCount === MAX_RETRIES) {
-                                elizaLogger.warn(`Failed to generate appropriate prompt for tweet ${tweet.id} after retries`);
-                                return {
-                                    shouldGenerateImage: false,
-                                    shouldReply: true,
-                                    isImageEditRequest: false,
-                                    reasoning: 'Failed to generate valid image prompt'
-                                };
+                                return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false, reasoning: 'Failed to generate valid image prompt' };
                             }
                             continue;
                         }
                         break;
                     } catch (error) {
                         retryCount++;
-                        elizaLogger.error(`Error generating prompt (attempt ${retryCount}/${MAX_RETRIES}):`, error);
                         if (retryCount === MAX_RETRIES) {
-                            return {
-                                shouldGenerateImage: false,
-                                shouldReply: true,
-                                isImageEditRequest: false,
-                                reasoning: 'Failed to generate valid image prompt'
-                            };
+                            return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false, reasoning: 'Failed to generate valid image prompt' };
                         }
                     }
                 }
             }
 
-            return {
-                shouldGenerateImage: intent.shouldGenerateImage,
-                shouldReply: intent.shouldReply,
-                isImageEditRequest: intent.isImageEditRequest,
-                prompt
-            };
+            return { ...intent, prompt };
         } catch (error) {
             elizaLogger.error('Error analyzing tweet intent:', error);
-            return {
-                shouldGenerateImage: false,
-                shouldReply: true,
-                isImageEditRequest: false
-            };
+            return { shouldGenerateImage: false, shouldReply: true, isImageEditRequest: false };
         }
     }
 
@@ -704,7 +589,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             const finalPrompt = promptResult.trim();
             if (!finalPrompt) {
                 elizaLogger.warn(`Empty prompt generated for tweet ${tweet.id}`);
-                return "A serene biblical scene of a shepherd tending sheep in a peaceful valley at sunset"; // Default prompt
+                return "A serene biblical scene of a shepherd tending sheep in a peaceful valley at sunset";
             }
 
             elizaLogger.info(`Generated image prompt for tweet ${tweet.id}: ${finalPrompt}`);
@@ -730,7 +615,7 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             }
             elizaLogger.info(`Found ${mentionCount} mentions`);
 
-            elizaLogger.info('Test 2: Searching for bot\'s own tweets...');
+            elizaLogger.info("Test 2: Searching for bot's own tweets...");
             const ownTweetsQuery = `from:${username}`;
             const ownTweetsResults = await this.scraper.searchTweets(ownTweetsQuery, 5, SearchMode.Latest);
             let ownTweetCount = 0;
@@ -755,118 +640,154 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
     }
 
     private async pollMentions(): Promise<void> {
+        const startTime = performance.now();
         try {
             if (this.isProcessing) {
                 elizaLogger.info('Previous polling cycle still in progress, skipping...');
                 return;
             }
-    
+
             this.isProcessing = true;
             elizaLogger.info('Starting new polling cycle...');
-    
+
             const username = process.env.TWITTER_USERNAME!.toLowerCase();
-            if (!username) {
-                throw new Error('TWITTER_USERNAME environment variable is not set');
-            }
-    
-            // Verify authentication
+            if (!username) throw new Error('TWITTER_USERNAME environment variable is not set');
+
             if (!(await this.scraper.isLoggedIn())) {
                 elizaLogger.warn('Scraper not authenticated, re-initializing...');
                 await this.initializeScraper();
             }
-    
-            // Track processed tweets in this cycle to avoid duplicates
+
             const processedTweetIds = new Set<string>();
-    
-            // Use single query with in-code filtering
+            const tweetBatch: any[] = [];
             const searchQuery = `@${username}`;
-            elizaLogger.info(`Executing search query: "${searchQuery}"`);
-            const mentionsGenerator = this.scraper.searchTweets(searchQuery, 20, SearchMode.Latest);
-    
-            let mentionsCount = 0;
-            let hasResults = false;
-            let lastTweetId: string | null = null;
-    
-            for await (const tweet of mentionsGenerator) {
-                elizaLogger.info(`Raw tweet data: ID=${tweet.id}, Username=${tweet.username}, Text="${tweet.text}", IsRetweet=${tweet.isRetweet}`);
-    
-                // Skip duplicates within cycle
-                if (processedTweetIds.has(tweet.id)) {
-                    elizaLogger.info(`Skipping duplicate tweet ${tweet.id} in this cycle`);
-                    continue;
-                }
-    
-                // Skip bot's own tweets
-                if (tweet.username.toLowerCase() === username) {
-                    elizaLogger.info(`Skipping bot's own tweet: ${tweet.id}`);
-                    processedTweetIds.add(tweet.id);
-                    continue;
-                }
-    
-                // Skip retweets
-                if (tweet.isRetweet) {
-                    elizaLogger.info(`Skipping retweet: ${tweet.id}`);
-                    processedTweetIds.add(tweet.id);
-                    continue;
-                }
-    
-                // Verify mention
-                if (!tweet.text.toLowerCase().includes(`@${username}`)) {
-                    elizaLogger.info(`Skipping tweet ${tweet.id} - does not contain @${username}`);
-                    processedTweetIds.add(tweet.id);
-                    continue;
-                }
-    
-                hasResults = true;
-                lastTweetId = tweet.id;
-                elizaLogger.info(`Processing mention: ${tweet.id} from @${tweet.username}: ${tweet.text}`);
-    
+            let retryCount = 0;
+            const MAX_RETRIES = 3;
+
+            while (retryCount < MAX_RETRIES) {
                 try {
-                    // Check if tweet is processed
+                    const searchStart = performance.now();
+                    const mentionsGenerator = this.scraper.searchTweets(searchQuery, 10, SearchMode.Latest);
+                    
+                    try {
+                        const tweets = [];
+                        const timeoutPromise = new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Search timeout')), 60000)
+                        );
+
+                        // Use Promise.race to handle timeout properly
+                        await Promise.race([
+                            (async () => {
+                                for await (const tweet of mentionsGenerator) {
+                                    tweets.push(tweet);
+                                    if (tweets.length >= 10) break;
+                                }
+                            })(),
+                            timeoutPromise
+                        ]);
+
+                        tweetBatch.push(...tweets);
+                        elizaLogger.info(`Search query "${searchQuery}" took ${(performance.now() - searchStart).toFixed(2)}ms, fetched ${tweets.length} tweets`);
+                    } catch (error) {
+                        if (error.message === 'Search timeout') {
+                            elizaLogger.warn('Search timed out, continuing with partial results');
+                            // Continue with any tweets we've collected so far
+                            if (tweetBatch.length > 0) {
+                                elizaLogger.info(`Continuing with ${tweetBatch.length} tweets collected before timeout`);
+                            } else {
+                                elizaLogger.warn('No tweets collected before timeout, skipping this cycle');
+                                return;
+                            }
+                        } else {
+                            elizaLogger.error(`Search error: ${error.message}`);
+                            throw error;
+                        }
+                    }
+
+                    break;
+                } catch (error) {
+                    retryCount++;
+                    elizaLogger.error(`Search attempt ${retryCount} failed: ${error.message}`, error);
+                    if (retryCount < MAX_RETRIES) {
+                        const backoffTime = 2000 * Math.pow(2, retryCount);
+                        elizaLogger.info(`Retrying search in ${backoffTime}ms`);
+                        await new Promise(resolve => setTimeout(resolve, backoffTime));
+                    } else {
+                        elizaLogger.error(`Failed to fetch mentions after ${MAX_RETRIES} attempts: ${error.message}`);
+                        break;
+                    }
+                }
+            }
+
+            let mentionsCount = 0;
+            let hasResults = tweetBatch.length > 0;
+            let lastTweetId: string | null = null;
+
+            const processTweet = async (tweet: any) => {
+                const tweetStart = performance.now();
+                elizaLogger.info(`Processing mention: ${tweet.id} from @${tweet.username}: ${tweet.text}`);
+
+                try {
+                    if (processedTweetIds.has(tweet.id)) {
+                        elizaLogger.info(`Skipping duplicate tweet ${tweet.id}`);
+                        return;
+                    }
+
+                    if (tweet.username.toLowerCase() === username) {
+                        elizaLogger.info(`Skipping bot's own tweet: ${tweet.id}`);
+                        processedTweetIds.add(tweet.id);
+                        return;
+                    }
+
+                    if (tweet.isRetweet) {
+                        elizaLogger.info(`Skipping retweet: ${tweet.id}`);
+                        processedTweetIds.add(tweet.id);
+                        return;
+                    }
+
+                    if (!tweet.text.toLowerCase().includes(`@${username}`)) {
+                        elizaLogger.info(`Skipping tweet ${tweet.id} - does not contain @${username}`);
+                        processedTweetIds.add(tweet.id);
+                        return;
+                    }
+
+                    lastTweetId = tweet.id;
                     const isProcessed = await this.isTweetProcessed(tweet.id);
-                    elizaLogger.info(`Tweet ${tweet.id} processed status: ${isProcessed}`);
-    
                     if (isProcessed) {
-                        // Verify if a reply exists
                         const hasReply = await this.verifyTweetReplied(tweet.id, username);
                         if (!hasReply) {
                             elizaLogger.warn(`Tweet ${tweet.id} marked as processed but no reply found, reprocessing`);
                         } else {
-                            elizaLogger.info(`Skipping already processed tweet ${tweet.id} with verified reply`);
+                            elizaLogger.info(`Skipping already processed tweet ${tweet.id}`);
                             processedTweetIds.add(tweet.id);
-                            continue;
+                            return;
                         }
                     }
-    
+
                     processedTweetIds.add(tweet.id);
-    
                     const cleanText = tweet.text.replace(/@\w+/g, '').trim();
                     if (!cleanText) {
-                        elizaLogger.info(`Skipping empty tweet ${tweet.id} after cleaning`);
+                        elizaLogger.info(`Skipping empty tweet ${tweet.id}`);
                         await this.markTweetAsProcessed(tweet.id);
-                        continue;
+                        return;
                     }
-    
+
                     if (this.isInappropriateContent(cleanText)) {
                         elizaLogger.info(`Skipping inappropriate content in tweet ${tweet.id}`);
                         await this.markTweetAsProcessed(tweet.id);
-                        continue;
+                        return;
                     }
-    
+
                     const intent = await this.analyzeTweetIntent(tweet, cleanText);
-                    elizaLogger.info(`Intent analysis for tweet ${tweet.id}:`, intent);
-    
                     let success = false;
+
                     if (intent.shouldGenerateImage && intent.prompt) {
                         try {
                             await this.handleImageRequest(tweet, intent.prompt);
                             success = true;
                         } catch (error) {
                             elizaLogger.error(`Failed to generate image for tweet ${tweet.id}:`, error);
-                            const fallbackResponse = await this.generateResponse(tweet, cleanText, {
-                                ...intent,
-                                shouldGenerateImage: false
-                            });
+                            const fallbackResponse = await this.generateResponse(tweet, cleanText, { ...intent, shouldGenerateImage: false });
                             if (fallbackResponse) {
                                 await this.replyToTweet(tweet.id, fallbackResponse);
                                 success = true;
@@ -879,18 +800,26 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                             success = true;
                         }
                     }
-    
+
                     if (success) {
                         await this.markTweetAsProcessed(tweet.id);
                         mentionsCount++;
                     } else {
                         elizaLogger.warn(`Failed to process tweet ${tweet.id}, not marking as processed`);
                     }
+
+                    elizaLogger.info(`Processed tweet ${tweet.id} in ${(performance.now() - tweetStart).toFixed(2)}ms`);
                 } catch (error) {
                     elizaLogger.error(`Error processing tweet ${tweet.id}:`, error);
                 }
+            };
+
+            const concurrencyLimit = 3;
+            for (let i = 0; i < tweetBatch.length; i += concurrencyLimit) {
+                const batch = tweetBatch.slice(i, i + concurrencyLimit);
+                await Promise.all(batch.map(processTweet));
             }
-    
+
             if (!hasResults) {
                 elizaLogger.info('No mentions found in this polling cycle');
             } else {
@@ -902,20 +831,19 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 elizaLogger.error('Authentication error, re-initializing scraper...');
                 await this.initializeScraper();
             } else if (error.message?.includes('429')) {
-                const backoffTime = Math.min(1000 * Math.pow(2, 0), 60000);
+                const backoffTime = 15000;
                 elizaLogger.info(`Rate limited, waiting ${backoffTime}ms`);
                 await new Promise(resolve => setTimeout(resolve, backoffTime));
             }
         } finally {
             this.isProcessing = false;
-            elizaLogger.info('Polling cycle completed');
+            this.conversationHistory.clear();
+            elizaLogger.info(`Polling cycle completed in ${(performance.now() - startTime).toFixed(2)}ms`);
         }
     }
-    
-    // New helper method to verify if a reply exists
+
     private async verifyTweetReplied(tweetId: string, username: string): Promise<boolean> {
         try {
-            // Fetch recent tweets from the bot
             const botTweets = this.scraper.searchTweets(`from:${username} @${username}`, 10, SearchMode.Latest);
             for await (const botTweet of botTweets) {
                 if (botTweet.inReplyToStatusId === tweetId) {
@@ -926,118 +854,111 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             return false;
         } catch (error) {
             elizaLogger.error(`Error verifying reply for tweet ${tweetId}:`, error);
-            return false; // Assume no reply if verification fails
+            return;
         }
     }
-
 
     async stop(): Promise<void> {
         if (this.pollInterval) {
             clearInterval(this.pollInterval);
             this.pollInterval = null;
         }
-        await this.db.close();
+        await this.database.cleanup();
     }
 
-    async postTweet(content: string): Promise<void> {
+    async replyToTweet(tweetId: string, content: string): Promise<void> {
         try {
-            const memory: Memory = {
-                id: stringToUuid(Date.now().toString()),
-                userId: this.runtime.agentId,
-                agentId: this.runtime.agentId,
-                roomId: stringToUuid('twitter'),
-                content: {
-                    text: content,
-                    action: 'POST_TWEET'
-                },
-                createdAt: Date.now()
-            };
-
-            const state: State = {
-                bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                lore: this.runtime.character.lore.join(' '),
-                messageDirections: this.runtime.character.style.post.join(' '),
-                postDirections: this.runtime.character.style.post.join(' '),
-                roomId: stringToUuid('twitter'),
-                actors: this.runtime.character.name,
-                recentMessages: content,
-                recentMessagesData: [memory]
-            };
-
-            await this.runtime.processActions(memory, [], state);
-
-            const result = await this.scraper.sendTweet(content);
-            const body = await result.json();
-
-            if (body.errors) {
-                const error = body.errors[0];
-                throw new Error(`Twitter error (${error.code}): ${error.message}`);
+            if (!(await this.scraper.isLoggedIn())) {
+                elizaLogger.warn('Scraper not authenticated, re-initializing...');
+                await this.initializeScraper();
             }
 
-            if (!body?.data?.create_tweet?.tweet_results?.result) {
-                throw new Error("Failed to post tweet: No tweet result in response");
-            }
-
-            elizaLogger.info(`Posted tweet: ${content}`);
-        } catch (error) {
-            await this.handleError(error, 'posting tweet');
-            throw error;
-        }
-    }
-
-    async replyToTweet(tweetId: string, response: string): Promise<void> {
-        try {
-            // Update conversation with response
-            await this.updateConversationResponse(tweetId, response);
-            
-            // Post reply
             const tweet = await this.scraper.getTweet(tweetId);
             if (!tweet) {
                 throw new Error(`Failed to get tweet ${tweetId}`);
             }
-            const replyContent = `@${tweet.username} ${response}`;
-            await this.scraper.sendTweet(replyContent, tweetId);
-            elizaLogger.info(`Successfully replied to tweet ${tweetId}`);
+
+            const replyContent = `@${tweet.username} ${content}`;
+            
+            // Use scraper's sendTweet method directly
+            const result = await this.scraper.sendTweet(replyContent, tweetId);
+            
+            // Check if the tweet was sent successfully
+            if (!result.ok) {
+                const errorText = await result.text();
+                throw new Error(`Failed to send tweet: ${errorText}`);
+            }
+
+            elizaLogger.info(`Posted reply to tweet ${tweetId}: ${replyContent}`);
         } catch (error) {
-            elizaLogger.error(`Error replying to tweet ${tweetId}:`, error);
+            elizaLogger.error(`Error posting reply to ${tweetId}: ${error.message}`, error);
+            throw error;
+        }
+    }
+
+    async postTweet(content: string): Promise<void> {
+        try {
+            if (!(await this.scraper.isLoggedIn())) {
+                elizaLogger.warn('Scraper not authenticated, re-initializing...');
+                await this.initializeScraper();
+            }
+
+            // Use scraper's sendTweet method directly
+            const result = await this.scraper.sendTweet(content);
+            
+            // Check if the tweet was sent successfully
+            if (!result.ok) {
+                const errorText = await result.text();
+                throw new Error(`Failed to send tweet: ${errorText}`);
+            }
+
+            elizaLogger.info(`Successfully posted tweet: ${content}`);
+        } catch (error) {
+            elizaLogger.error(`Error posting tweet: ${error.message}`, error);
             throw error;
         }
     }
 
     async searchTweets(query: string) {
         try {
-            return await this.scraper.searchTweets(query, 10, SearchMode.Top);
+            if (!(await this.scraper.isLoggedIn())) {
+                elizaLogger.warn('Scraper not authenticated, re-initializing...');
+                await this.initializeScraper();
+            }
+            return await this.scraper.searchTweets(query, 10, SearchMode.Latest);
         } catch (error) {
-            await this.handleError(error, "tweet search");
+            elizaLogger.error(`Error searching tweets for query "${query}": ${error.message}`, error);
             throw error;
         }
     }
 
     async getTimeline() {
         try {
-            return await this.scraper.getTweets(process.env.TWITTER_USERNAME!, 10);
+            if (!(await this.scraper.isLoggedIn())) {
+                elizaLogger.warn('Scraper not authenticated, re-initializing...');
+                await this.initializeScraper();
+            }
+            return await this.scraper.searchTweets(`from:${process.env.TWITTER_USERNAME!}`, 10, SearchMode.Latest);
         } catch (error) {
-            await this.handleError(error, "timeline fetch");
+            elizaLogger.error('Error fetching timeline:', error);
             throw error;
         }
     }
 
     private async startPeriodicPosting(): Promise<void> {
-        const POST_INTERVAL = 60000; // 1 minute
+        const POST_INTERVAL = 900000; // 15min
         const MAX_RETRIES = 3;
 
-        elizaLogger.info(`Starting periodic posting every ${POST_INTERVAL/1000} seconds`);
+        elizaLogger.info(`Starting periodic posting every ${POST_INTERVAL / 1000} seconds`);
 
         const generateAndPostTweet = async () => {
-            if (this.isProcessing) {
-                elizaLogger.warn('Previous tweet generation still in progress, forcing reset');
-                this.isProcessing = false;
-            }
-
-            this.isProcessing = true;
-            let retryCount = 0;
-
             try {
+                if (this.isPosting) {
+                    elizaLogger.info('Previous periodic posting in progress, skipping');
+                    return;
+                }
+
+                this.isPosting = true;
                 const topics = this.runtime.character.topics;
                 const style = this.runtime.character.style.post;
                 const adjectives = this.runtime.character.adjectives;
@@ -1045,8 +966,6 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                 const randomTopic = topics[Math.floor(Math.random() * topics.length)];
                 const randomStyle = style[Math.floor(Math.random() * style.length)];
                 const randomAdjective = adjectives[Math.floor(Math.random() * adjectives.length)];
-
-                elizaLogger.info(`Generating tweet about ${randomTopic} in ${randomAdjective} style`);
 
                 const state: State = {
                     bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
@@ -1059,141 +978,108 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
                     recentMessagesData: []
                 };
 
-                const context = composeContext({
-                    state,
-                    template: `You are ${this.runtime.character.name}. Generate a tweet that is ${randomAdjective} about ${randomTopic}. The tweet should ${randomStyle}. Keep it under 280 characters. No hashtags or emojis.`
+                const context = await composeContext({
+                    state: {
+                        bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
+                        lore: this.runtime.character.lore.join(' '),
+                        messageDirections: this.runtime.character.style.post.join(' '),
+                        postDirections: this.runtime.character.style.post.join(' '),
+                        roomId: this.runtime.agentId,
+                        actors: this.runtime.character.name,
+                        recentMessages: `Generate a tweet about ${randomTopic}`,
+                        recentMessagesData: []
+                    },
+                    template: `You are ${this.runtime.character.name}. Generate a tweet that is ${randomAdjective} about ${randomTopic}}. The tweet should ${randomStyle}}. Keep it under 280 characters. No hashtags or emojis.`
                 });
 
                 const tweetContent = await generateText({
                     runtime: this.runtime,
                     context,
-                    modelClass: ModelClass.LARGE
+                    modelClass: ModelClass.SMALL
                 });
 
-                elizaLogger.info(`Generated tweet content: ${tweetContent}`);
-
+                let retryCount = 0;
                 while (retryCount < MAX_RETRIES) {
                     try {
                         await this.postTweet(tweetContent);
-                        elizaLogger.info('Successfully posted tweet');
+                        elizaLogger.info('Successfully posted periodic tweet');
                         break;
                     } catch (error) {
                         retryCount++;
-                        elizaLogger.error(`Failed to post tweet (attempt ${retryCount}/${MAX_RETRIES}):`, error);
+                        elizaLogger.error(`Failed to post periodic tweet (${retryCount}/${MAX_RETRIES}): ${error.message}`, error);
                         if (retryCount < MAX_RETRIES) {
-                            const backoffTime = Math.min(1000 * Math.pow(2, retryCount), 5000);
-                            elizaLogger.info(`Retrying in ${backoffTime}ms...`);
+                            const backoffTime = 2000 * Math.pow(2, retryCount);
+                            elizaLogger.info(`Retrying in ${backoffTime}ms`);
                             await new Promise(resolve => setTimeout(resolve, backoffTime));
+                        } else {
+                            elizaLogger.error('Failed to post periodic tweet after retries');
                         }
                     }
                 }
-
-                if (retryCount === MAX_RETRIES) {
-                    elizaLogger.error('Failed to post tweet after all retries');
-                }
             } catch (error) {
-                elizaLogger.error('Error in generateAndPostTweet:', error);
-                await this.handleError(error, 'periodic posting');
+                elizaLogger.error('Error in periodic posting:', error);
             } finally {
-                this.isProcessing = false;
-                elizaLogger.info('Tweet generation completed, reset isProcessing flag');
+                this.isPosting = false;
             }
         };
 
-        setTimeout(generateAndPostTweet, 5000);
-
-        const scheduleNextPost = () => {
-            elizaLogger.info(`Scheduling next post in ${POST_INTERVAL/1000} seconds`);
-
-            setTimeout(async () => {
-                try {
-                    await generateAndPostTweet();
-                } catch (error) {
-                    elizaLogger.error('Error in scheduled post:', error);
-                } finally {
-                    scheduleNextPost();
-                }
-            }, POST_INTERVAL);
-        };
-
-        scheduleNextPost();
-    }
-
-    private async updateConversationResponse(tweetId: string, response: string): Promise<void> {
-        const now = Date.now();
-        await this.db.run(
-            `UPDATE conversations 
-             SET response = ?, replied_at = ? 
-             WHERE tweet_id = ? AND response IS NULL`,
-            [response, now, tweetId]
-        );
-    }
-
-    private async getConversationHistory(tweetId: string, limit: number = 10): Promise<Array<{
-        message: string;
-        response: string | null;
-        created_at: number;
-    }>> {
-        return await this.db.all(
-            `SELECT message, response, created_at 
-             FROM conversations 
-             WHERE tweet_id = ? 
-             ORDER BY created_at DESC 
-             LIMIT ?`,
-            [tweetId, limit]
-        );
-    }
-
-    private async storeConversation(
-        tweetId: string,
-        userId: string,
-        username: string,
-        message: string,
-        response: string | null = null
-    ): Promise<void> {
-        const now = Date.now();
-        await this.db.run(
-            `INSERT INTO conversations (tweet_id, user_id, username, message, response, created_at, replied_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [tweetId, userId, username, message, response, now, response ? now : null]
-        );
-    }
-
-    private async generateResponse(tweet: TwitterClientTweet, cleanText: string, intent: TweetIntent): Promise<string | null> {
         try {
-            // Mark tweet as replied first
-            await this.markTweetAsProcessed(tweet.id);
-            
-            // Get conversation history
-            const history = await this.getConversationHistory(tweet.id);
-            
-            // Build context from history
-            const context = history.map(h => 
-                `User: ${h.message}\nAssistant: ${h.response || ''}`
-            ).join('\n\n');
-            
-            // Add current message
-            const fullContext = context ? `${context}\n\nUser: ${cleanText}` : `User: ${cleanText}`;
-            
-            // Generate response using context
-            const response = await generateText({
-                runtime: this.runtime,
-                context: fullContext,
-                modelClass: ModelClass.LARGE
-            });
+            setTimeout(generateAndPostTweet, 10000);
 
-            if (response) {
-                // Store conversation
-                await this.storeConversation(
-                    tweet.id,
-                    tweet.username,
-                    tweet.username,
-                    cleanText,
-                    response
-                );
+            const scheduleNextPost = () => {
+                setTimeout(async () => {
+                    try {
+                        await generateAndPostTweet();
+                    } catch (error) {
+                        elizaLogger.error('Error in scheduled periodic post:', error);
+                    } finally {
+                        scheduleNextPost();
+                    }
+                }, POST_INTERVAL);
+            };
+
+            scheduleNextPost();
+        } catch (error) {
+            elizaLogger.error('Failed to start periodic posting:', error);
+        }
+    }
+
+    private async generateResponse(tweet: Tweet, cleanText: string, intent: TweetIntent): Promise<string | null> {
+        try {
+            if (intent.shouldGenerateImage) {
+                await this.handleImageRequest(tweet, intent.prompt!);
+                return null;
+            } else if (intent.shouldReply) {
+                const conversationId = tweet.inReplyToStatusId || tweet.id;
+                const context = await this.buildConversationContext(tweet, conversationId);
+
+                return await generateText({
+                    runtime: this.runtime,
+                    context: composeContext({
+                        state: {
+                            bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
+                            lore: this.runtime.character.lore.join(' '),
+                            messageDirections: this.runtime.character.style.post.join(' '),
+                            postDirections: this.runtime.character.style.post.join(' '),
+                            roomId: stringToUuid(conversationId),
+                            actors: this.runtime.character.name,
+                            recentMessages: context,
+                            recentMessagesData: []
+                        },
+                        template: `You are Jesus Christ}. Respond to this tweet: "${cleanText}": using one of these formats:
+                        1. A relevant Scripture quote
+                        2. A paraphrased biblical truth
+                        3. A Christlike question
+                        4. A short modern parable
+
+                        Previous conversation:\n
+                        ${context}
+                        Keep it under 280 characters. No hashtags or emojis.`
+                    }),
+                    modelClass: ModelClass.SMALL
+                });
             }
-
-            return response;
+            return null;
         } catch (error) {
             elizaLogger.error('Error generating response:', error);
             return null;
@@ -1205,7 +1091,6 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
             const username = process.env.TWITTER_USERNAME!;
             const password = process.env.TWITTER_PASSWORD!;
             const email = process.env.TWITTER_EMAIL!;
-
             this.scraper = new Scraper();
             await this.scraper.login(username, password, email);
             elizaLogger.info('Successfully re-initialized Twitter scraper');
@@ -1215,3 +1100,4 @@ Return a clear, descriptive sentence (e.g., "A serene biblical scene of a shephe
         }
     }
 }
+ 

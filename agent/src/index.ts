@@ -31,7 +31,6 @@ import { fileURLToPath } from "url";
 import yargs from "yargs";
 import Database from "better-sqlite3";
 import { SqliteDatabaseAdapter } from "@elizaos/adapter-sqlite";
-import { Database as TwitterDatabase } from "./database";
 
 const __filename = fileURLToPath(import.meta.url); // get the resolved path to the file
 const __dirname = path.dirname(__filename); // get the name of the directory
@@ -635,10 +634,120 @@ export async function createAgent(
         fs.mkdirSync(dataDir, { recursive: true });
     }
     
-    const database = new Database(dbPath);
+    // Initialize database with optimized settings
+    const database = new Database(dbPath, {
+        verbose: elizaLogger.debug,
+        // Enable WAL mode for better concurrency
+        pragma: {
+            journal_mode: 'WAL',
+            synchronous: 'NORMAL',
+            cache_size: -2000, // Use 2MB of cache
+            temp_store: 'MEMORY',
+            mmap_size: 30000000000, // 30GB memory map
+            page_size: 4096,
+            busy_timeout: 5000,
+            foreign_keys: 'ON'
+        }
+    });
+
+    // Create prepared statements for frequently used queries
+    const preparedStatements = {
+        getMessages: database.prepare(`
+            SELECT * FROM conversation_messages 
+            WHERE conversation_id = ? 
+            ORDER BY timestamp ASC
+            LIMIT ?
+        `),
+        getRecentMessages: database.prepare(`
+            SELECT * FROM conversation_messages 
+            WHERE conversation_id = ? 
+            AND timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        `),
+        getUserMessages: database.prepare(`
+            SELECT * FROM conversation_messages 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC
+            LIMIT ?
+        `),
+        insertMessage: database.prepare(`
+            INSERT INTO conversation_messages 
+            (id, conversation_id, role, content, timestamp, user_id, is_bot, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `),
+        updateConversation: database.prepare(`
+            INSERT OR REPLACE INTO conversations 
+            (id, created_at, last_updated, metadata)
+            VALUES (?, COALESCE((SELECT created_at FROM conversations WHERE id = ?), ?), ?, ?)
+        `)
+    };
+
     const databaseAdapter = new SqliteDatabaseAdapter(database);
     await databaseAdapter.init();
 
+    // Create tables with proper error handling
+    try {
+        database.exec(`
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_updated INTEGER NOT NULL,
+                metadata TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                user_id TEXT,
+                is_bot BOOLEAN NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation_id 
+            ON conversation_messages(conversation_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_user_id 
+            ON conversation_messages(user_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_timestamp 
+            ON conversation_messages(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_composite 
+            ON conversation_messages(conversation_id, timestamp, user_id);
+
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_embeddings_text 
+            ON embeddings(text);
+        `);
+    } catch (error) {
+        elizaLogger.error('Error creating database tables:', error);
+        throw error;
+    }
+
+    // Enable RAG knowledge in character settings if not already enabled
+    if (!character.settings) {
+        character.settings = {};
+    }
+    character.settings.ragKnowledge = true;
+
+    // Set knowledge root and ensure it exists
+    const knowledgeRoot = path.join(process.cwd(), "agent", "Knowledge");
+    if (!fs.existsSync(knowledgeRoot)) {
+        fs.mkdirSync(knowledgeRoot, { recursive: true });
+    }
+
+    // Initialize runtime with optimized settings
     const runtime = new AgentRuntime({
         character,
         token,
@@ -647,18 +756,328 @@ export async function createAgent(
         databaseAdapter: databaseAdapter
     });
 
-    // Set knowledge root
-    const knowledgeRoot = path.join(process.cwd(), "agent", "Knowledge");
+    // Configure RAG system
     (runtime as any).knowledgeRoot = knowledgeRoot;
     (runtime as any).ragKnowledgeManager.knowledgeRoot = knowledgeRoot;
 
-    // Add RAG interface to runtime
+    // Initialize caches and constants
+    const ragCache = new Map<string, { data: any; timestamp: number }>();
+    const embeddingCache = new Map<string, { embedding: Float32Array; timestamp: number }>();
+    const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache TTL
+    const EMBEDDING_CACHE_TTL = 30 * 60 * 1000; // 30 minutes cache TTL
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 1000; // 1 second
+
+    // Add optimized embedding with better error handling
+    (runtime as any).embed = async (text: string) => {
+        try {
+            // Check embedding cache first
+            const cached = embeddingCache.get(text);
+            if (cached && Date.now() - cached.timestamp < EMBEDDING_CACHE_TTL) {
+                return cached.embedding;
+            }
+
+            // Check database cache
+            const stmt = database.prepare('SELECT embedding FROM embeddings WHERE text = ? ORDER BY created_at DESC LIMIT 1');
+            const cachedEmbedding = stmt.get(text);
+            if (cachedEmbedding) {
+                const embedding = new Float32Array(cachedEmbedding.embedding);
+                embeddingCache.set(text, { embedding, timestamp: Date.now() });
+                return embedding;
+            }
+
+            // Ensure text is not too long
+            const maxLength = 8192;
+            const truncatedText = text.length > maxLength ? text.substring(0, maxLength) : text;
+
+            // Add retry logic with exponential backoff
+            let lastError;
+            for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                try {
+                    const embeddingArray = await (runtime as any).ragKnowledgeManager.embed(truncatedText);
+                    
+                    if (!Array.isArray(embeddingArray) || embeddingArray.length === 0) {
+                        throw new Error('Invalid embedding array received');
+                    }
+
+                    const embedding = new Float32Array(embeddingArray);
+                    
+                    // Cache in memory
+                    embeddingCache.set(text, { embedding, timestamp: Date.now() });
+                    
+                    // Cache in database
+                    try {
+                        const insertStmt = database.prepare(
+                            'INSERT INTO embeddings (id, text, embedding, created_at) VALUES (?, ?, ?, ?)'
+                        );
+                        insertStmt.run(
+                            stringToUuid(Date.now().toString()),
+                            text,
+                            Buffer.from(embeddingArray),
+                            Date.now()
+                        );
+                    } catch (dbError) {
+                        elizaLogger.warn('Failed to cache embedding in database:', dbError);
+                    }
+                    
+                    return embedding;
+                } catch (error) {
+                    lastError = error;
+                    if (attempt < MAX_RETRIES - 1) {
+                        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * Math.pow(2, attempt)));
+                    }
+                }
+            }
+
+            elizaLogger.warn(`Embedding failed after ${MAX_RETRIES} attempts, using zero vector`);
+            return new Float32Array(1536).fill(0);
+        } catch (error) {
+            elizaLogger.error(`Embedding error: ${error}`);
+            return new Float32Array(1536).fill(0);
+        }
+    };
+
+    // Add conversation history management with database storage
+    (runtime as any).conversation = {
+        // Store a message in conversation history
+        storeMessage: async (conversationId: string, role: string, content: string, metadata: any = {}) => {
+            try {
+                const timestamp = Date.now();
+                const messageId = `${conversationId}-${timestamp}`;
+                const isBot = role === 'assistant';
+
+                // Use prepared statements for faster inserts
+                preparedStatements.updateConversation.run(
+                    conversationId, 
+                    conversationId, 
+                    timestamp, 
+                    timestamp, 
+                    JSON.stringify(metadata)
+                );
+
+                preparedStatements.insertMessage.run(
+                    messageId,
+                    conversationId,
+                    role,
+                    content,
+                    timestamp,
+                    role === 'user' ? conversationId : null,
+                    isBot ? 1 : 0,
+                    JSON.stringify(metadata)
+                );
+
+                // Also store in RAG for semantic search with error handling
+                try {
+                    await (runtime as any).rag.store({
+                        id: messageId,
+                        content: content,
+                        metadata: {
+                            type: 'conversation',
+                            conversationId,
+                            role,
+                            timestamp,
+                            userId: role === 'user' ? conversationId : undefined,
+                            isBot,
+                            ...metadata
+                        }
+                    });
+                } catch (ragError) {
+                    elizaLogger.error(`RAG store error (non-fatal): ${ragError}`);
+                    // Continue execution even if RAG store fails
+                }
+
+                return { id: messageId, timestamp };
+            } catch (error) {
+                elizaLogger.error(`Error storing conversation message: ${error}`);
+                throw error;
+            }
+        },
+
+        // Get conversation history with pagination
+        getHistory: async (conversationId: string, options: { 
+            limit?: number; 
+            before?: number; 
+            after?: number;
+            userId?: string;
+        } = {}) => {
+            try {
+                const { limit = 100, before, after, userId } = options;
+                
+                // Use prepared statement for faster query
+                const messages = preparedStatements.getMessages.all(conversationId, limit);
+                
+                // Apply filters in memory for better performance
+                return messages
+                    .filter(msg => {
+                        if (userId && msg.user_id !== userId) return false;
+                        if (before && msg.timestamp >= before) return false;
+                        if (after && msg.timestamp <= after) return false;
+                        return true;
+                    })
+                    .map(msg => ({
+                        ...msg,
+                        metadata: JSON.parse(msg.metadata || '{}'),
+                        isBot: Boolean(msg.is_bot)
+                    }));
+            } catch (error) {
+                elizaLogger.error(`Error retrieving conversation history: ${error}`);
+                return [];
+            }
+        },
+
+        // Get conversation context with comprehensive history
+        getContext: async (conversationId: string, query: string, options: {
+            userId?: string;
+            timeWindow?: number;
+        } = {}) => {
+            try {
+                const { userId, timeWindow } = options;
+                const cutoffTime = timeWindow ? Date.now() - timeWindow : 0;
+                
+                // Use prepared statement for faster query
+                const recentHistory = preparedStatements.getRecentMessages.all(
+                    conversationId,
+                    cutoffTime,
+                    50
+                );
+
+                // Get relevant past conversations from RAG in parallel
+                const [relevantResults] = await Promise.all([
+                    (runtime as any).rag.search(
+                        `${query} conversation:${conversationId}${userId ? ` userId:${userId}` : ''}`,
+                        20
+                    )
+                ]);
+
+                return {
+                    recentHistory: recentHistory.map(msg => ({
+                        ...msg,
+                        metadata: JSON.parse(msg.metadata || '{}'),
+                        isBot: Boolean(msg.is_bot)
+                    })),
+                    relevantPast: relevantResults.map(result => ({
+                        role: result.metadata.role,
+                        content: result.content,
+                        timestamp: result.metadata.timestamp,
+                        userId: result.metadata.userId,
+                        isBot: result.metadata.isBot,
+                        metadata: result.metadata
+                    }))
+                };
+            } catch (error) {
+                elizaLogger.error(`Error getting conversation context: ${error}`);
+                return { recentHistory: [], relevantPast: [] };
+            }
+        },
+
+        // Get all conversations for a user
+        getUserConversations: async (userId: string, options: {
+            limit?: number;
+            before?: number;
+            after?: number;
+        } = {}) => {
+            try {
+                const { limit = 100 } = options;
+                
+                // Use prepared statement for faster query
+                const messages = preparedStatements.getUserMessages.all(userId, limit);
+                
+                // Group messages by conversation
+                const conversations = new Map();
+                messages.forEach(msg => {
+                    if (!conversations.has(msg.conversation_id)) {
+                        conversations.set(msg.conversation_id, {
+                            id: msg.conversation_id,
+                            messages: []
+                        });
+                    }
+                    conversations.get(msg.conversation_id).messages.push({
+                        ...msg,
+                        metadata: JSON.parse(msg.metadata || '{}'),
+                        isBot: Boolean(msg.is_bot)
+                    });
+                });
+
+                return Array.from(conversations.values());
+            } catch (error) {
+                elizaLogger.error(`Error getting user conversations: ${error}`);
+                return [];
+            }
+        }
+    };
+
     (runtime as any).rag = {
         search: async (query: string, limit: number) => {
-            return await (runtime as any).ragKnowledgeManager.search(query, limit);
+            try {
+                // Check cache first
+                const cacheKey = `search:${query}:${limit}`;
+                const cached = ragCache.get(cacheKey);
+                if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+                    return cached.data;
+                }
+
+                // Perform search with retries
+                let attempts = 0;
+                const maxAttempts = 3;
+                while (attempts < maxAttempts) {
+                    try {
+                        const embedding = await (runtime as any).embed(query);
+                        const results = await (runtime as any).ragKnowledgeManager.searchKnowledge({
+                            agentId: runtime.agentId,
+                            embedding: embedding,
+                            match_threshold: 0.7,
+                            match_count: limit * 2, // Get more results for better reranking
+                            searchText: query
+                        });
+
+                        // Cache successful results
+                        ragCache.set(cacheKey, { data: results, timestamp: Date.now() });
+                        return results;
+                    } catch (error) {
+                        attempts++;
+                        if (attempts === maxAttempts) {
+                            elizaLogger.error(`RAG search failed after ${maxAttempts} attempts:`, error);
+                            return [];
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+                    }
+                }
+            } catch (error) {
+                elizaLogger.error(`RAG search error: ${error}`);
+                return [];
+            }
         },
         store: async (data: { id: string; content: string; metadata: any }) => {
-            return await (runtime as any).ragKnowledgeManager.store(data);
+            try {
+                // Perform store with retries
+                let attempts = 0;
+                const maxAttempts = 3;
+                while (attempts < maxAttempts) {
+                    try {
+                        const embedding = await (runtime as any).embed(data.content);
+                        await (runtime as any).ragKnowledgeManager.createKnowledge({
+                            id: data.id,
+                            agentId: runtime.agentId,
+                            content: {
+                                text: data.content,
+                                metadata: data.metadata
+                            },
+                            embedding: embedding,
+                            createdAt: Date.now()
+                        });
+                        return;
+                    } catch (error) {
+                        attempts++;
+                        if (attempts === maxAttempts) {
+                            elizaLogger.error(`RAG store failed after ${maxAttempts} attempts:`, error);
+                            return;
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+                    }
+                }
+            } catch (error) {
+                elizaLogger.error(`RAG store error: ${error}`);
+            }
         }
     };
 
@@ -666,10 +1085,7 @@ export async function createAgent(
     const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
 
     // Use runtimeWithRag for TwitterIntegration
-    const db = new TwitterDatabase();
-    await db.initialize();
-    const twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
-    await twitterIntegration.initialize();
+    const twitterIntegration = new TwitterIntegration(runtimeWithRag);
 
     return runtime;
 }
@@ -783,9 +1199,7 @@ async function initializeTwitter(runtime: AgentRuntime) {
             }
         };
         const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-        const db = new TwitterDatabase();
-        await db.initialize();
-        const twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
+        const twitterIntegration = new TwitterIntegration(runtimeWithRag);
         await twitterIntegration.initialize();
         
         if (!twitterIntegration.initialized) {
@@ -850,9 +1264,7 @@ async function startAgent(
                     }
                 };
                 const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-                const db = new TwitterDatabase();
-                await db.initialize();
-                twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
+                twitterIntegration = new TwitterIntegration(runtimeWithRag);
                 await twitterIntegration.initialize();
                 
                 // Add Twitter integration to runtime for persistence
@@ -966,48 +1378,66 @@ const startAgents = async () => {
         const databaseAdapter = new SqliteDatabaseAdapter(database);
         await databaseAdapter.init();
 
-        // Initialize the agent runtime
-        const runtime = new AgentRuntime({
-            character,
-            token,
-            modelProvider: character.modelProvider,
-            logging: true,
-            databaseAdapter: databaseAdapter
-        }) as unknown as IAgentRuntimeWithRAG; // First cast to unknown, then to IAgentRuntimeWithRAG
+        // Initialize the agent runtime with optimized RAG system
+        const runtime = await createAgent(character, token);
 
-        // Add RAG interface to runtime
-        (runtime as any).rag = {
-            search: async (query: string, limit: number) => {
-                return await (runtime as any).ragKnowledgeManager.search(query, limit);
-            },
-            store: async (data: { id: string; content: string; metadata: any }) => {
-                return await (runtime as any).ragKnowledgeManager.store(data);
-            }
-        };
-
-        // Initialize RAG system and process knowledge files
+        // Initialize RAG system and process knowledge files with retries
         elizaLogger.info('Initializing RAG system and processing knowledge files...');
+        let initAttempts = 0;
+        const maxInitAttempts = 3;
+        
+        while (initAttempts < maxInitAttempts) {
+            try {
+                // Ensure knowledge directory exists
+                const knowledgeRoot = path.join(process.cwd(), "agent", "Knowledge");
+                if (!fs.existsSync(knowledgeRoot)) {
+                    fs.mkdirSync(knowledgeRoot, { recursive: true });
+                }
+
+                // Add basic knowledge if none exists
+                const basicKnowledgePath = path.join(knowledgeRoot, "basic_knowledge.txt");
+                if (!fs.existsSync(basicKnowledgePath)) {
+                    const basicKnowledge = `This is a basic knowledge file for testing the RAG system.
+
+Key Concepts:
+1. The RAG (Retrieval-Augmented Generation) system combines retrieval-based and generation-based approaches.
+2. It uses embeddings to find relevant information from the knowledge base.
+3. The system can process both text and PDF files.
+4. Knowledge files should be placed in the agent/Knowledge directory.
+
+Example Questions and Answers:
+Q: What is RAG?
+A: RAG stands for Retrieval-Augmented Generation, a system that combines retrieval of relevant information with text generation.
+
+Q: How does the knowledge system work?
+A: The system processes knowledge files, creates embeddings, and uses them to find relevant information when answering questions.
+
+Q: Where should knowledge files be placed?
+A: Knowledge files should be placed in the agent/Knowledge directory for the system to process them.`;
+                    fs.writeFileSync(basicKnowledgePath, basicKnowledge);
+                }
+
+                // Initialize the runtime
         await runtime.initialize();
         elizaLogger.info('RAG system and knowledge files processed successfully');
+                break;
+            } catch (error) {
+                initAttempts++;
+                if (initAttempts === maxInitAttempts) {
+                    elizaLogger.error('Failed to initialize RAG system after multiple attempts:', error);
+                    throw error;
+                }
+                elizaLogger.warn(`RAG initialization attempt ${initAttempts} failed, retrying...`);
+                await new Promise(resolve => setTimeout(resolve, 2000 * initAttempts));
+            }
+        }
 
         // Initialize Twitter integration if credentials are available
         let twitterIntegration: TwitterIntegration | null = null;
         if (process.env.TWITTER_USERNAME && process.env.TWITTER_PASSWORD && process.env.TWITTER_EMAIL) {
             try {
                 elizaLogger.info('Initializing Twitter integration...');
-                // Add RAG interface to runtime
-                (runtime as any).rag = {
-                    search: async (query: string, limit: number) => {
-                        return await (runtime as any).ragKnowledgeManager.search(query, limit);
-                    },
-                    store: async (data: { id: string; content: string; metadata: any }) => {
-                        return await (runtime as any).ragKnowledgeManager.store(data);
-                    }
-                };
-                const runtimeWithRag = runtime as IAgentRuntimeWithRAG;
-                const db = new TwitterDatabase();
-                await db.initialize();
-                twitterIntegration = new TwitterIntegration(runtimeWithRag, db);
+                twitterIntegration = new TwitterIntegration(runtime as IAgentRuntimeWithRAG);
                 await twitterIntegration.initialize();
                 
                 // Add Twitter integration to runtime for persistence
