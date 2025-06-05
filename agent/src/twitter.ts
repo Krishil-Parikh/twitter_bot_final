@@ -14,6 +14,8 @@ export interface IAgentRuntimeWithRAG extends AgentRuntime {
         get(key: string): Promise<any>;
         set(key: string, value: any): Promise<void>;
     };
+    embeddingProvider?: string;
+    embeddingModel?: string;
 }
 
 interface TweetIntent {
@@ -1107,20 +1109,31 @@ Keep the response under 280 characters. No hashtags or emojis. Ensure the reply 
                 throw new Error('Failed to generate valid embedding');
             }
 
-            elizaLogger.info(`[RAG] Converting embedding to buffer...`);
-            const embeddingBuffer = Buffer.from(embedding);
-            elizaLogger.info(`[RAG] Buffer size: ${embeddingBuffer.length} bytes`);
-            elizaLogger.info(`[RAG] First few values: ${embedding.slice(0, 5).join(', ')}...`);
+            elizaLogger.info(`[RAG] Converting embedding to Float32Array...`);
+            const float32Embedding = new Float32Array(embedding);
+            elizaLogger.info(`[RAG] Float32Array size: ${float32Embedding.length} elements`);
+            elizaLogger.info(`[RAG] First few values: ${Array.from(float32Embedding.slice(0, 5)).join(', ')}...`);
 
             const id = stringToUuid(Date.now().toString());
             elizaLogger.info(`[RAG] Storing in RAG with ID: ${id}`);
             
-            await this.runtime.rag.store({
+            // Get embedding info from runtime
+            const embeddingInfo = {
+                dim: float32Embedding.length,
+                type: 'float32',
+                version: '1.0',
+                provider: this.runtime.embeddingProvider || 'default',
+                model: this.runtime.embeddingModel || 'default',
+                checksum: this.generateEmbeddingChecksum(Array.from(float32Embedding))
+            };
+            
+            await this.database.storeRAGEmbedding(
                 id,
                 content,
+                Array.from(float32Embedding),
                 metadata,
-                embedding: embeddingBuffer
-            });
+                embeddingInfo
+            );
             
             elizaLogger.info(`[RAG] Successfully stored in RAG: ${content.slice(0, 50)}...`);
         } catch (error) {
@@ -1145,17 +1158,35 @@ Keep the response under 280 characters. No hashtags or emojis. Ensure the reply 
         }
     }
 
+    private generateEmbeddingChecksum(embedding: number[]): string {
+        // Simple checksum generation - you might want to use a more robust method
+        const sum = embedding.reduce((acc, val) => acc + val, 0);
+        return Buffer.from(sum.toString()).toString('base64');
+    }
+
     private async searchRAG(query: string, limit: number): Promise<Array<{ content: string; metadata: any }>> {
         let retryCount = 0;
         const MAX_RETRIES = 3;
         while (retryCount < MAX_RETRIES) {
             try {
+                elizaLogger.info(`[RAG] Generating embedding for search query: ${query}`);
+                const embedding = await embed(this.runtime, query);
+                
+                if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+                    throw new Error('Failed to generate valid embedding');
+                }
+
+                elizaLogger.info(`[RAG] Converting embedding to Float32Array...`);
+                const float32Embedding = new Float32Array(embedding);
+                elizaLogger.info(`[RAG] Float32Array size: ${float32Embedding.length} elements`);
+                elizaLogger.info(`[RAG] First few values: ${Array.from(float32Embedding.slice(0, 5)).join(', ')}...`);
+
                 const results = await this.runtime.rag.search(query, limit);
-                elizaLogger.info(`RAG search successful for query: ${query}`);
+                elizaLogger.info(`[RAG] Search successful for query: ${query}`);
                 return results;
             } catch (error) {
                 retryCount++;
-                elizaLogger.error(`RAG search failed for query "${query}" (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
+                elizaLogger.error(`[RAG] Search failed for query "${query}" (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`);
                 if (retryCount < MAX_RETRIES) {
                     const backoffTime = 1000 * Math.pow(2, retryCount);
                     await new Promise(resolve => setTimeout(resolve, backoffTime));

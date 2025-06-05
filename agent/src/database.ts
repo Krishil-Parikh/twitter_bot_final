@@ -61,16 +61,30 @@ export class Database {
                 CREATE TABLE IF NOT EXISTS rag_embeddings (
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
-                    embedding BLOB NOT NULL,
+                    embedding TEXT NOT NULL,
                     metadata TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+                    last_accessed INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+                    access_count INTEGER DEFAULT 0,
+                    embedding_dim INTEGER NOT NULL,
+                    embedding_type TEXT NOT NULL,
+                    embedding_version TEXT NOT NULL,
+                    embedding_provider TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    embedding_checksum TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_conversation_id ON conversation_history (conversation_id);
                 CREATE INDEX IF NOT EXISTS idx_tweet_id ON conversation_history (tweet_id);
                 CREATE INDEX IF NOT EXISTS idx_username ON conversation_history (username);
                 CREATE INDEX IF NOT EXISTS idx_rag_created_at ON rag_embeddings (created_at);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_created_at ON rag_embeddings(created_at);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_last_accessed ON rag_embeddings(last_accessed);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_access_count ON rag_embeddings(access_count);
             `);
+
+            // Migrate any existing binary embeddings to JSON format
+            await this.migrateEmbeddingsToJSON();
 
             await this.checkHealth();
             await this.maintainDatabase();
@@ -79,6 +93,54 @@ export class Database {
         } catch (error) {
             elizaLogger.error(`Error initializing database: ${error.message}`, error);
             throw error;
+        }
+    }
+
+    private async migrateEmbeddingsToJSON(): Promise<void> {
+        try {
+            elizaLogger.info('[DB] Starting embedding migration to JSON format...');
+            
+            // Get all entries with binary embeddings
+            const entries = await this.db.all('SELECT id, embedding FROM rag_embeddings WHERE embedding NOT LIKE "[%"');
+            
+            if (entries.length === 0) {
+                elizaLogger.info('[DB] No binary embeddings found to migrate');
+                return;
+            }
+
+            elizaLogger.info(`[DB] Found ${entries.length} binary embeddings to migrate`);
+
+            for (const entry of entries) {
+                try {
+                    // Try to convert binary data to Float32Array
+                    let embedding: number[];
+                    try {
+                        const buffer = Buffer.from(entry.embedding);
+                        const float32Array = new Float32Array(buffer.buffer);
+                        embedding = Array.from(float32Array);
+                    } catch (error) {
+                        elizaLogger.error(`[DB] Failed to convert binary embedding for id ${entry.id}: ${error.message}`);
+                        continue;
+                    }
+
+                    // Convert to JSON string
+                    const embeddingStr = JSON.stringify(embedding);
+
+                    // Update the entry
+                    await this.db.run(
+                        'UPDATE rag_embeddings SET embedding = ? WHERE id = ?',
+                        [embeddingStr, entry.id]
+                    );
+
+                    elizaLogger.info(`[DB] Successfully migrated embedding for id ${entry.id}`);
+                } catch (error) {
+                    elizaLogger.error(`[DB] Error migrating embedding for id ${entry.id}: ${error.message}`);
+                }
+            }
+
+            elizaLogger.info('[DB] Completed embedding migration');
+        } catch (error) {
+            elizaLogger.error(`[DB] Error during embedding migration: ${error.message}`);
         }
     }
 
@@ -208,15 +270,26 @@ export class Database {
                 CREATE TABLE rag_embeddings (
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
-                    embedding BLOB NOT NULL,
+                    embedding TEXT NOT NULL,
                     metadata TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+                    last_accessed INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+                    access_count INTEGER DEFAULT 0,
+                    embedding_dim INTEGER NOT NULL,
+                    embedding_type TEXT NOT NULL,
+                    embedding_version TEXT NOT NULL,
+                    embedding_provider TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    embedding_checksum TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_conversation_id ON conversation_history (conversation_id);
                 CREATE INDEX IF NOT EXISTS idx_tweet_id ON conversation_history (tweet_id);
                 CREATE INDEX IF NOT EXISTS idx_username ON conversation_history (username);
                 CREATE INDEX IF NOT EXISTS idx_rag_created_at ON rag_embeddings (created_at);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_created_at ON rag_embeddings(created_at);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_last_accessed ON rag_embeddings(last_accessed);
+                CREATE INDEX IF NOT EXISTS idx_rag_embeddings_access_count ON rag_embeddings(access_count);
             `);
 
             // Restore data from backups
@@ -292,17 +365,40 @@ export class Database {
         }
     }
 
-    async storeRAGEmbedding(id: string, content: string, embedding: Buffer, metadata: any): Promise<void> {
+    async storeRAGEmbedding(
+        id: string, 
+        content: string, 
+        embedding: number[], 
+        metadata: any,
+        embeddingInfo: {
+            dim: number;
+            type: string;
+            version: string;
+            provider: string;
+            model: string;
+            checksum: string;
+        }
+    ): Promise<void> {
         return this.withTransaction('storeRAGEmbedding', async () => {
             try {
                 // Input validation
-                if (!id || !content || !embedding || !metadata) {
+                if (!id || !content || !embedding || !metadata || !embeddingInfo) {
                     throw new Error('Missing required fields for RAG embedding storage');
                 }
 
                 if (embedding.length === 0) {
-                    throw new Error('Empty embedding buffer');
+                    throw new Error('Empty embedding array');
                 }
+
+                // Validate embedding values
+                const hasNaN = embedding.some(val => isNaN(val));
+                const hasInf = embedding.some(val => !isFinite(val));
+                if (hasNaN || hasInf) {
+                    throw new Error(`Invalid embedding values detected: ${hasNaN ? 'NaN' : ''} ${hasInf ? 'Infinity' : ''}`);
+                }
+
+                // Store embedding as JSON string
+                const embeddingStr = JSON.stringify(embedding);
 
                 // Validate metadata format
                 const metadataStr = JSON.stringify(metadata);
@@ -310,13 +406,31 @@ export class Database {
                     throw new Error('Invalid metadata format');
                 }
 
-                elizaLogger.info(`[DB] Storing RAG embedding - ID: ${id}, Content length: ${content.length}, Embedding size: ${embedding.length} bytes`);
+                elizaLogger.info(`[DB] Storing RAG embedding - ID: ${id}, Content length: ${content.length}, Embedding size: ${embedding.length} values`);
 
                 // Direct insert with error handling
                 try {
                     await this.db.run(
-                        'INSERT OR REPLACE INTO rag_embeddings (id, content, embedding, metadata, created_at) VALUES (?, ?, ?, ?, ?)',
-                        [id, content, embedding, metadataStr, Date.now()]
+                        `INSERT OR REPLACE INTO rag_embeddings (
+                            id, content, embedding, metadata, created_at, last_accessed,
+                            access_count, embedding_dim, embedding_type, embedding_version,
+                            embedding_provider, embedding_model, embedding_checksum
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                            id, 
+                            content, 
+                            embeddingStr, 
+                            metadataStr, 
+                            Date.now(),
+                            Date.now(),
+                            0, // initial access_count
+                            embedding.length,
+                            embeddingInfo.type,
+                            embeddingInfo.version,
+                            embeddingInfo.provider,
+                            embeddingInfo.model,
+                            embeddingInfo.checksum
+                        ]
                     );
                     elizaLogger.info(`[DB] Successfully stored RAG embedding for ${id}`);
                 } catch (dbError) {
@@ -325,9 +439,12 @@ export class Database {
                 }
 
                 // Verify storage
-                const stored = await this.db.get('SELECT id FROM rag_embeddings WHERE id = ?', [id]);
+                const stored = await this.db.get('SELECT id, length(embedding) as embedding_length FROM rag_embeddings WHERE id = ?', [id]);
                 if (!stored) {
                     throw new Error('Failed to verify RAG embedding storage');
+                }
+                if (stored.embedding_length === 0) {
+                    throw new Error('Stored embedding is empty');
                 }
             } catch (error) {
                 elizaLogger.error(`[DB] Error storing RAG embedding: ${error.message}`, error);
@@ -489,13 +606,15 @@ export class Database {
 
     async repairRAGEntries(): Promise<void> {
         try {
-            // Find entries with empty embeddings
+            elizaLogger.info('[DB] Starting RAG entries repair...');
+            
+            // Find entries with empty embeddings or invalid JSON
             const invalidEntries = await this.db.all(
-                'SELECT id, content, metadata FROM rag_embeddings WHERE length(embedding) = 0'
+                'SELECT id, content, metadata FROM rag_embeddings WHERE length(embedding) = 0 OR embedding IS NULL OR embedding NOT LIKE "[%"'
             );
             
             if (invalidEntries.length > 0) {
-                elizaLogger.warn(`Found ${invalidEntries.length} invalid RAG entries`);
+                elizaLogger.warn(`[DB] Found ${invalidEntries.length} invalid RAG entries`);
                 
                 // Store invalid entries in conversation history as fallback
                 for (const entry of invalidEntries) {
@@ -509,53 +628,216 @@ export class Database {
                             timestamp: metadata.timestamp,
                             type: metadata.type
                         });
+                        elizaLogger.info(`[DB] Stored invalid entry ${entry.id} in conversation history`);
                     } catch (error) {
-                        elizaLogger.error(`Error storing invalid RAG entry in conversation history: ${error.message}`);
+                        elizaLogger.error(`[DB] Error storing invalid RAG entry in conversation history: ${error.message}`);
                     }
                 }
                 
                 // Delete invalid entries
-                await this.db.run('DELETE FROM rag_embeddings WHERE length(embedding) = 0');
-                elizaLogger.info(`Deleted ${invalidEntries.length} invalid RAG entries`);
+                await this.db.run('DELETE FROM rag_embeddings WHERE length(embedding) = 0 OR embedding IS NULL OR embedding NOT LIKE "[%"');
+                elizaLogger.info(`[DB] Deleted ${invalidEntries.length} invalid RAG entries`);
+            }
+
+            // Verify remaining entries
+            const remainingEntries = await this.db.all(
+                'SELECT id, length(embedding) as embedding_length FROM rag_embeddings'
+            );
+            
+            const validEntries = remainingEntries.filter(entry => entry.embedding_length > 0);
+            elizaLogger.info(`[DB] Verified ${validEntries.length} valid RAG entries`);
+            
+            if (validEntries.length !== remainingEntries.length) {
+                elizaLogger.warn(`[DB] Found ${remainingEntries.length - validEntries.length} entries with invalid embeddings`);
             }
         } catch (error) {
-            elizaLogger.error(`Error repairing RAG entries: ${error.message}`, error);
+            elizaLogger.error(`[DB] Error repairing RAG entries: ${error.message}`, error);
         }
     }
 
-    async searchRAG(query: string, limit: number): Promise<Array<{ content: string; metadata: any }>> {
-        return this.withTransaction('searchRAG', async () => {
-            try {
-                // First try to get embeddings for the query
-                const queryEmbedding = await this.runtime.generateEmbedding(query);
-                if (!queryEmbedding || queryEmbedding.length === 0) {
-                    elizaLogger.warn('Failed to generate query embedding, falling back to conversation history');
-                    return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', query.split('from:')[1]?.split(' ')[0] || '');
-                }
+    async searchRAG(query: string, limit: number, username?: string): Promise<Array<{ content: string; metadata: any }>> {
+        try {
+            // First repair any invalid entries
+            await this.repairRAGEntries();
 
-                // Use vector similarity search if available
-                const results = await this.db.all(`
-                    SELECT content, metadata, embedding
-                    FROM rag_embeddings
-                    WHERE length(embedding) > 0
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                `, [limit]);
-
-                if (results.length === 0) {
-                    elizaLogger.warn('No RAG results found, falling back to conversation history');
-                    return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', query.split('from:')[1]?.split(' ')[0] || '');
-                }
-
-                return results.map(row => ({
-                    content: row.content,
-                    metadata: JSON.parse(row.metadata)
-                }));
-            } catch (error) {
-                elizaLogger.error(`Error in searchRAG: ${error.message}`, error);
-                // Fallback to conversation history on error
-                return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', query.split('from:')[1]?.split(' ')[0] || '');
+            // Extract username from query if not provided
+            if (!username) {
+                username = query.split('from:')[1]?.split(' ')[0] || '';
             }
-        });
+            elizaLogger.info(`[RAG] Searching for user: ${username}`);
+
+            // First try to get embeddings for the query with detailed logging
+            let queryEmbedding: number[];
+            let retryCount = 0;
+            const MAX_RETRIES = 3;
+
+            while (retryCount < MAX_RETRIES) {
+                try {
+                    elizaLogger.info(`[RAG] Attempting to generate embedding (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+                    queryEmbedding = await this.runtime.generateEmbedding(query);
+                    
+                    if (!queryEmbedding) {
+                        throw new Error('Embedding generation returned null');
+                    }
+                    
+                    if (queryEmbedding.length === 0) {
+                        throw new Error('Embedding generation returned empty array');
+                    }
+
+                    // Validate embedding values
+                    const hasNaN = queryEmbedding.some(val => isNaN(val));
+                    const hasInf = queryEmbedding.some(val => !isFinite(val));
+                    
+                    if (hasNaN || hasInf) {
+                        throw new Error(`Invalid embedding values detected: ${hasNaN ? 'NaN' : ''} ${hasInf ? 'Infinity' : ''}`);
+                    }
+
+                    elizaLogger.info(`[RAG] Successfully generated embedding with dimension: ${queryEmbedding.length}`);
+                    elizaLogger.info(`[RAG] First few values: ${queryEmbedding.slice(0, 5).join(', ')}...`);
+                    break; // Success, exit retry loop
+                } catch (embedError) {
+                    retryCount++;
+                    elizaLogger.error(`[RAG] Embedding generation failed (attempt ${retryCount}/${MAX_RETRIES}): ${embedError.message}`);
+                    
+                    if (retryCount === MAX_RETRIES) {
+                        elizaLogger.error('[RAG] All embedding generation attempts failed');
+                        return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+                    }
+                    
+                    // Wait before retrying
+                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+                }
+            }
+
+            // Get all embeddings from the database with detailed logging
+            let results;
+            try {
+                elizaLogger.info('[RAG] Querying database for embeddings...');
+                
+                // First check if we have any valid embeddings for this user
+                const countQuery = username ? 
+                    'SELECT COUNT(*) as count FROM rag_embeddings WHERE length(embedding) > 0 AND embedding LIKE "[%" AND json_extract(metadata, "$.username") = ?' :
+                    'SELECT COUNT(*) as count FROM rag_embeddings WHERE length(embedding) > 0 AND embedding LIKE "[%"';
+                
+                const countResult = await this.db.get(countQuery, username ? [username] : []);
+                elizaLogger.info(`[RAG] Total valid embeddings for user ${username}: ${countResult.count}`);
+
+                if (countResult.count === 0) {
+                    elizaLogger.warn(`[RAG] No valid embeddings found for user ${username}, searching all embeddings`);
+                    // If no results for specific user, search all embeddings
+                    results = await this.db.all(`
+                        SELECT id, content, metadata, embedding, embedding_dim
+                        FROM rag_embeddings
+                        WHERE length(embedding) > 0 AND embedding LIKE "[%"
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    `, [limit * 2]);
+                } else {
+                    // Get embeddings for specific user
+                    results = await this.db.all(`
+                        SELECT id, content, metadata, embedding, embedding_dim
+                        FROM rag_embeddings
+                        WHERE length(embedding) > 0 
+                        AND embedding LIKE "[%"
+                        AND json_extract(metadata, "$.username") = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    `, [username, limit * 2]);
+                }
+                
+                elizaLogger.info(`[RAG] Retrieved ${results.length} embeddings from database`);
+                
+                if (results.length === 0) {
+                    elizaLogger.warn('[RAG] No results found after filtering');
+                    return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+                }
+
+                // Log first result for debugging
+                const firstResult = results[0];
+                elizaLogger.info(`[RAG] First result - ID: ${firstResult.id}, Content length: ${firstResult.content.length}, Embedding length: ${firstResult.embedding.length}`);
+                elizaLogger.info(`[RAG] First result embedding preview: ${firstResult.embedding.substring(0, 100)}...`);
+            } catch (dbError) {
+                elizaLogger.error(`[RAG] Database error retrieving embeddings: ${dbError.message}`);
+                elizaLogger.error(`[RAG] SQLite error code: ${dbError.code}`);
+                elizaLogger.error(`[RAG] SQLite error details:`, dbError);
+                throw dbError;
+            }
+
+            // Calculate cosine similarity for each result with detailed error handling
+            const scoredResults = results.map(row => {
+                try {
+                    // Validate row data
+                    if (!row.embedding || !row.content || !row.metadata) {
+                        elizaLogger.warn(`[RAG] Invalid row data for id ${row.id}: missing required fields`);
+                        return null;
+                    }
+
+                    // Parse stored embedding from JSON string
+                    let storedEmbedding: number[];
+                    try {
+                        storedEmbedding = JSON.parse(row.embedding);
+                        
+                        if (storedEmbedding.length !== queryEmbedding.length) {
+                            elizaLogger.warn(`[RAG] Dimension mismatch for id ${row.id}: expected ${queryEmbedding.length}, got ${storedEmbedding.length}`);
+                            return null;
+                        }
+                    } catch (vectorError) {
+                        elizaLogger.error(`[RAG] Error parsing embedding for id ${row.id}: ${vectorError.message}`);
+                        elizaLogger.error(`[RAG] Raw embedding data: ${row.embedding.substring(0, 100)}...`);
+                        return null;
+                    }
+                    
+                    // Calculate cosine similarity
+                    let dotProduct = 0;
+                    let queryMagnitude = 0;
+                    let storedMagnitude = 0;
+                    
+                    for (let i = 0; i < queryEmbedding.length; i++) {
+                        dotProduct += queryEmbedding[i] * storedEmbedding[i];
+                        queryMagnitude += queryEmbedding[i] * queryEmbedding[i];
+                        storedMagnitude += storedEmbedding[i] * storedEmbedding[i];
+                    }
+                    
+                    const similarity = dotProduct / (Math.sqrt(queryMagnitude) * Math.sqrt(storedMagnitude));
+                    
+                    // Parse metadata with error handling
+                    let parsedMetadata;
+                    try {
+                        parsedMetadata = JSON.parse(row.metadata);
+                    } catch (parseError) {
+                        elizaLogger.error(`[RAG] Error parsing metadata for id ${row.id}: ${parseError.message}`);
+                        parsedMetadata = {};
+                    }
+                    
+                    return {
+                        content: row.content,
+                        metadata: parsedMetadata,
+                        similarity
+                    };
+                } catch (error) {
+                    elizaLogger.error(`[RAG] Error processing embedding for ${row.id}: ${error.message}`);
+                    return null;
+                }
+            }).filter(Boolean);
+
+            if (scoredResults.length === 0) {
+                elizaLogger.warn('[RAG] No valid results after similarity calculation');
+                return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+            }
+
+            // Sort by similarity and take top results
+            const sortedResults = scoredResults
+                .sort((a, b) => b.similarity - a.similarity)
+                .slice(0, limit)
+                .map(({ content, metadata }) => ({ content, metadata }));
+
+            elizaLogger.info(`[RAG] Returning ${sortedResults.length} results with similarity scores`);
+            return sortedResults;
+
+        } catch (error) {
+            elizaLogger.error(`[RAG] Error in searchRAG: ${error.message}`, error);
+            // Fallback to conversation history on error
+            return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+        }
     }
 }

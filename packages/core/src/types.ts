@@ -1247,6 +1247,32 @@ export interface IRAGKnowledgeManager {
     }): Promise<void>;
     cleanupDeletedKnowledgeFiles(): Promise<void>;
     generateScopedId(path: string, isShared: boolean): UUID;
+    storeRAGEmbedding(params: {
+        id: UUID;
+        content: string;
+        embedding: number[];
+        metadata: any;
+        embeddingInfo: {
+            embedding_dim: number;
+            embedding_type: string;
+            embedding_version: string;
+            embedding_provider: string;
+            embedding_model: string;
+            embedding_checksum: string;
+        };
+    }): Promise<void>;
+    getRAGEmbeddings(params: {
+        agentId: UUID;
+        limit?: number;
+    }): Promise<RAGKnowledgeItem[]>;
+    searchRAG(params: {
+        agentId: UUID;
+        embedding: number[];
+        match_threshold: number;
+        match_count: number;
+    }): Promise<RAGKnowledgeItem[]>;
+    checkRAGHealth(): Promise<boolean>;
+    repairRAGEntries(): Promise<void>;
 }
 
 export type CacheOptions = {

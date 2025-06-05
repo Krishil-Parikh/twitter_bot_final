@@ -12,6 +12,17 @@ import { stringToUuid } from "./uuid.ts";
 import { existsSync } from "fs";
 import { join } from "path";
 
+// Extend IAgentRuntime to include embedding properties
+interface IAgentRuntimeWithEmbedding extends IAgentRuntime {
+    embeddingProvider?: string;
+    embeddingModel?: string;
+    cache: {
+        get(key: string): Promise<any>;
+        set(key: string, value: any): Promise<void>;
+    };
+    generateEmbedding(text: string): Promise<number[]>;
+}
+
 /**
  * Manage knowledge in the database.
  */
@@ -19,7 +30,7 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
     /**
      * The AgentRuntime instance associated with this manager.
      */
-    runtime: IAgentRuntime;
+    runtime: IAgentRuntimeWithEmbedding;
 
     /**
      * The name of the database table this manager operates on.
@@ -39,7 +50,7 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
      */
     constructor(opts: {
         tableName: string;
-        runtime: IAgentRuntime;
+        runtime: IAgentRuntimeWithEmbedding;
         knowledgeRoot: string;
     }) {
         this.runtime = opts.runtime;
@@ -117,7 +128,6 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
      * @param content The text content to preprocess.
      * @returns The preprocessed text.
      */
-
     private preprocess(content: string): string {
         if (!content || typeof content !== "string") {
             elizaLogger.warn("Invalid input for preprocessing");
@@ -214,7 +224,6 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
                 }
 
                 const embeddingArray = await embed(this.runtime, searchText);
-
                 const embedding = new Float32Array(embeddingArray);
 
                 // Get results with single query
@@ -240,111 +249,59 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
                             result.content.text.toLowerCase().includes(term)
                         );
 
+                        // Boost score for direct term matches
                         if (matchingTerms.length > 0) {
-                            // Much stronger boost for matches
-                            score *=
-                                1 +
-                                (matchingTerms.length / queryTerms.length) * 2; // Double the boost
+                            score += 0.1 * matchingTerms.length;
+                        }
 
-                            if (
-                                this.hasProximityMatch(
-                                    result.content.text,
-                                    matchingTerms
-                                )
-                            ) {
-                                score *= 1.5; // Stronger proximity boost
+                        // Check for proximity matches
+                        if (this.hasProximityMatch(result.content.text, queryTerms)) {
+                            score += 0.2;
+                        }
+
+                        // Check for metadata matches
+                        if (result.content.metadata) {
+                            const metadata = result.content.metadata as {
+                                title?: string;
+                                tags?: string[];
+                            };
+                            if (metadata.title && processedQuery.toLowerCase().includes(metadata.title.toLowerCase())) {
+                                score += 0.3;
                             }
-                        } else {
-                            // More aggressive penalty
-                            if (!params.conversationContext) {
-                                score *= 0.3; // Stronger penalty
+                            if (metadata.tags && Array.isArray(metadata.tags)) {
+                                const matchingTags = metadata.tags.filter((tag: string) =>
+                                    processedQuery.toLowerCase().includes(tag.toLowerCase())
+                                );
+                                if (matchingTags.length > 0) {
+                                    score += 0.1 * matchingTags.length;
+                                }
                             }
                         }
 
                         return {
                             ...result,
                             score,
-                            matchedTerms: matchingTerms, // Add for debugging
                         };
                     })
-                    .sort((a, b) => b.score - a.score);
-
-                // Filter and return results
-                return rerankedResults
-                    .filter(
-                        (result) =>
-                            result.score >= this.defaultRAGMatchThreshold
-                    )
+                    .sort((a, b) => (b.score || 0) - (a.score || 0))
                     .slice(0, params.limit || this.defaultRAGMatchCount);
+
+                return rerankedResults;
             } catch (error) {
-                console.log(`[RAG Search Error] ${error}`);
+                elizaLogger.error("Error in getKnowledge:", error);
                 return [];
             }
         }
 
-        // If neither id nor query provided, return empty array
-        return [];
+        // If no query, return all knowledge
+        return this.runtime.databaseAdapter.getKnowledge({
+            agentId: agentId,
+            limit: params.limit,
+        });
     }
 
     async createKnowledge(item: RAGKnowledgeItem): Promise<void> {
-        if (!item.content.text) {
-            elizaLogger.warn("Empty content in knowledge item");
-            return;
-        }
-
-        try {
-            // Process main document
-            const processedContent = this.preprocess(item.content.text);
-            const mainEmbeddingArray = await embed(
-                this.runtime,
-                processedContent
-            );
-
-            const mainEmbedding = new Float32Array(mainEmbeddingArray);
-
-            // Create main document
-            await this.runtime.databaseAdapter.createKnowledge({
-                id: item.id,
-                agentId: this.runtime.agentId,
-                content: {
-                    text: item.content.text,
-                    metadata: {
-                        ...item.content.metadata,
-                        isMain: true,
-                    },
-                },
-                embedding: mainEmbedding,
-                createdAt: Date.now(),
-            });
-
-            // Generate and store chunks
-            const chunks = await splitChunks(processedContent, 512, 20);
-
-            for (const [index, chunk] of chunks.entries()) {
-                const chunkEmbeddingArray = await embed(this.runtime, chunk);
-                const chunkEmbedding = new Float32Array(chunkEmbeddingArray);
-                const chunkId = `${item.id}-chunk-${index}` as UUID;
-
-                await this.runtime.databaseAdapter.createKnowledge({
-                    id: chunkId,
-                    agentId: this.runtime.agentId,
-                    content: {
-                        text: chunk,
-                        metadata: {
-                            ...item.content.metadata,
-                            isChunk: true,
-                            originalId: item.id,
-                            chunkIndex: index,
-                        },
-                    },
-                    embedding: chunkEmbedding,
-                    createdAt: Date.now(),
-                });
-            }
-        } catch (error) {
-            elizaLogger.error(`Error processing knowledge ${item.id}:`, error);
-            throw error;
-        }
+        await this.runtime.databaseAdapter.createKnowledge(item);
     }
 
     async searchKnowledge(params: {
@@ -354,23 +311,16 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
         match_count?: number;
         searchText?: string;
     }): Promise<RAGKnowledgeItem[]> {
-        const {
-            match_threshold = this.defaultRAGMatchThreshold,
-            match_count = this.defaultRAGMatchCount,
-            embedding,
-            searchText,
-        } = params;
+        const float32Embedding = Array.isArray(params.embedding)
+            ? new Float32Array(params.embedding)
+            : params.embedding;
 
-        const float32Embedding = Array.isArray(embedding)
-            ? new Float32Array(embedding)
-            : embedding;
-
-        return await this.runtime.databaseAdapter.searchKnowledge({
-            agentId: params.agentId || this.runtime.agentId,
+        return this.runtime.databaseAdapter.searchKnowledge({
+            agentId: params.agentId,
             embedding: float32Embedding,
-            match_threshold,
-            match_count,
-            searchText,
+            match_threshold: params.match_threshold || this.defaultRAGMatchThreshold,
+            match_count: params.match_count || this.defaultRAGMatchCount,
+            searchText: params.searchText,
         });
     }
 
@@ -379,261 +329,200 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
     }
 
     async clearKnowledge(shared?: boolean): Promise<void> {
-        await this.runtime.databaseAdapter.clearKnowledge(
-            this.runtime.agentId,
-            shared ? shared : false
-        );
+        await this.runtime.databaseAdapter.clearKnowledge(this.runtime.agentId, shared);
     }
 
-    /**
-     * Lists all knowledge entries for an agent without semantic search or reranking.
-     * Used primarily for administrative tasks like cleanup.
-     *
-     * @param agentId The agent ID to fetch knowledge entries for
-     * @returns Array of RAGKnowledgeItem entries
-     */
     async listAllKnowledge(agentId: UUID): Promise<RAGKnowledgeItem[]> {
-        elizaLogger.debug(
-            `[Knowledge List] Fetching all entries for agent: ${agentId}`
-        );
-
-        try {
-            // Only pass the required agentId parameter
-            const results = await this.runtime.databaseAdapter.getKnowledge({
-                agentId: agentId,
-            });
-
-            elizaLogger.debug(
-                `[Knowledge List] Found ${results.length} entries`
-            );
-            return results;
-        } catch (error) {
-            elizaLogger.error(
-                "[Knowledge List] Error fetching knowledge entries:",
-                error
-            );
-            throw error;
-        }
-    }
-
-    async cleanupDeletedKnowledgeFiles() {
-        try {
-            elizaLogger.debug(
-                "[Cleanup] Starting knowledge cleanup process, agent: ",
-                this.runtime.agentId
-            );
-
-            elizaLogger.debug(
-                `[Cleanup] Knowledge root path: ${this.knowledgeRoot}`
-            );
-
-            const existingKnowledge = await this.listAllKnowledge(
-                this.runtime.agentId
-            );
-            // Only process parent documents, ignore chunks
-            const parentDocuments = existingKnowledge.filter(
-                (item) =>
-                    !item.id.includes("chunk") && item.content.metadata?.source // Must have a source path
-            );
-
-            elizaLogger.debug(
-                `[Cleanup] Found ${parentDocuments.length} parent documents to check`
-            );
-
-            for (const item of parentDocuments) {
-                const relativePath = item.content.metadata?.source;
-                const filePath = join(this.knowledgeRoot, relativePath);
-
-                elizaLogger.debug(
-                    `[Cleanup] Checking joined file path: ${filePath}`
-                );
-
-                if (!existsSync(filePath)) {
-                    elizaLogger.warn(
-                        `[Cleanup] File not found, starting removal process: ${filePath}`
-                    );
-
-                    const idToRemove = item.id;
-                    elizaLogger.debug(
-                        `[Cleanup] Using ID for removal: ${idToRemove}`
-                    );
-
-                    try {
-                        // Just remove the parent document - this will cascade to chunks
-                        await this.removeKnowledge(idToRemove);
-
-                        // // Clean up the cache
-                        // const baseCacheKeyWithWildcard = `${this.generateKnowledgeCacheKeyBase(
-                        //     idToRemove,
-                        //     item.content.metadata?.isShared || false
-                        // )}*`;
-                        // await this.cacheManager.deleteByPattern({
-                        //     keyPattern: baseCacheKeyWithWildcard,
-                        // });
-
-                        elizaLogger.success(
-                            `[Cleanup] Successfully removed knowledge for file: ${filePath}`
-                        );
-                    } catch (deleteError) {
-                        elizaLogger.error(
-                            `[Cleanup] Error during deletion process for ${filePath}:`,
-                            deleteError instanceof Error
-                                ? {
-                                      message: deleteError.message,
-                                      stack: deleteError.stack,
-                                      name: deleteError.name,
-                                  }
-                                : deleteError
-                        );
-                    }
-                }
-            }
-
-            elizaLogger.debug("[Cleanup] Finished knowledge cleanup process");
-        } catch (error) {
-            elizaLogger.error(
-                "[Cleanup] Error cleaning up deleted knowledge files:",
-                error
-            );
-        }
-    }
-
-    public generateScopedId(path: string, isShared: boolean): UUID {
-        // Prefix the path with scope before generating UUID to ensure different IDs for shared vs private
-        const scope = isShared ? KnowledgeScope.SHARED : KnowledgeScope.PRIVATE;
-        const scopedPath = `${scope}-${path}`;
-        return stringToUuid(scopedPath);
+        return this.runtime.databaseAdapter.getKnowledge({
+            agentId: agentId,
+        });
     }
 
     async processFile(file: {
         path: string;
         content: string;
         type: "pdf" | "md" | "txt";
-        isShared?: boolean;
+        isShared: boolean;
     }): Promise<void> {
-        const timeMarker = (label: string) => {
-            const time = (Date.now() - startTime) / 1000;
-            elizaLogger.info(`[Timing] ${label}: ${time.toFixed(2)}s`);
+        const { path, content, type, isShared } = file;
+        const id = this.generateScopedId(path, isShared);
+        const embedding = await this.runtime.generateEmbedding(content);
+        const embeddingInfo = {
+            embedding_dim: embedding.length,
+            embedding_type: type,
+            embedding_version: '1.0',
+            embedding_provider: this.runtime.embeddingProvider || 'default',
+            embedding_model: this.runtime.embeddingModel || 'default',
+            embedding_checksum: await this.generateEmbeddingChecksum(embedding)
         };
 
-        const startTime = Date.now();
-        const content = file.content;
+        await this.storeRAGEmbedding({
+            id,
+            content,
+            embedding,
+            metadata: {
+                path,
+                type,
+                isShared,
+                isMain: true
+            },
+            embeddingInfo
+        });
+    }
 
-        try {
-            const fileSizeKB = new TextEncoder().encode(content).length / 1024;
-            elizaLogger.info(
-                `[File Progress] Starting ${file.path} (${fileSizeKB.toFixed(2)} KB)`
-            );
+    async cleanupDeletedKnowledgeFiles(): Promise<void> {
+        const rows = await this.runtime.databaseAdapter.db.all(
+            `SELECT * FROM ${this.tableName} WHERE metadata LIKE '%"isMain":true%'`
+        );
 
-            // Generate scoped ID for the file
-            const scopedId = this.generateScopedId(
-                file.path,
-                file.isShared || false
-            );
-
-            // Step 1: Preprocessing
-            //const preprocessStart = Date.now();
-            const processedContent = this.preprocess(content);
-            timeMarker("Preprocessing");
-
-            // Step 2: Main document embedding
-            const mainEmbeddingArray = await embed(
-                this.runtime,
-                processedContent
-            );
-            const mainEmbedding = new Float32Array(mainEmbeddingArray);
-            timeMarker("Main embedding");
-
-            // Step 3: Create main document
-            await this.runtime.databaseAdapter.createKnowledge({
-                id: scopedId,
-                agentId: this.runtime.agentId,
-                content: {
-                    text: content,
-                    metadata: {
-                        source: file.path,
-                        type: file.type,
-                        isShared: file.isShared || false,
-                    },
-                },
-                embedding: mainEmbedding,
-                createdAt: Date.now(),
-            });
-            timeMarker("Main document storage");
-
-            // Step 4: Generate chunks
-            const chunks = await splitChunks(processedContent, 512, 20);
-            const totalChunks = chunks.length;
-            elizaLogger.info(`Generated ${totalChunks} chunks`);
-            timeMarker("Chunk generation");
-
-            // Step 5: Process chunks with larger batches
-            const BATCH_SIZE = 10; // Increased batch size
-            let processedChunks = 0;
-
-            for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-                const batchStart = Date.now();
-                const batch = chunks.slice(
-                    i,
-                    Math.min(i + BATCH_SIZE, chunks.length)
-                );
-
-                // Process embeddings in parallel
-                const embeddings = await Promise.all(
-                    batch.map((chunk) => embed(this.runtime, chunk))
-                );
-
-                // Batch database operations
-                await Promise.all(
-                    embeddings.map(async (embeddingArray, index) => {
-                        const chunkId =
-                            `${scopedId}-chunk-${i + index}` as UUID;
-                        const chunkEmbedding = new Float32Array(embeddingArray);
-
-                        await this.runtime.databaseAdapter.createKnowledge({
-                            id: chunkId,
-                            agentId: this.runtime.agentId,
-                            content: {
-                                text: batch[index],
-                                metadata: {
-                                    source: file.path,
-                                    type: file.type,
-                                    isShared: file.isShared || false,
-                                    isChunk: true,
-                                    originalId: scopedId,
-                                    chunkIndex: i + index,
-                                    originalPath: file.path,
-                                },
-                            },
-                            embedding: chunkEmbedding,
-                            createdAt: Date.now(),
-                        });
-                    })
-                );
-
-                processedChunks += batch.length;
-                const batchTime = (Date.now() - batchStart) / 1000;
-                elizaLogger.info(
-                    `[Batch Progress] ${file.path}: Processed ${processedChunks}/${totalChunks} chunks (${batchTime.toFixed(2)}s for batch)`
-                );
+        for (const row of rows) {
+            const metadata = JSON.parse(row.metadata);
+            if (metadata.path && !existsSync(join(this.knowledgeRoot, metadata.path))) {
+                await this.removeKnowledge(row.id);
             }
-
-            const totalTime = (Date.now() - startTime) / 1000;
-            elizaLogger.info(
-                `[Complete] Processed ${file.path} in ${totalTime.toFixed(2)}s`
-            );
-        } catch (error) {
-            if (
-                file.isShared &&
-                error?.code === "SQLITE_CONSTRAINT_PRIMARYKEY"
-            ) {
-                elizaLogger.info(
-                    `Shared knowledge ${file.path} already exists in database, skipping creation`
-                );
-                return;
-            }
-            elizaLogger.error(`Error processing file ${file.path}:`, error);
-            throw error;
         }
+    }
+
+    generateScopedId(path: string, isShared: boolean): UUID {
+        const scope = isShared ? KnowledgeScope.SHARED : KnowledgeScope.PRIVATE;
+        return stringToUuid(`${scope}:${path}`);
+    }
+
+    async storeRAGEmbedding(params: {
+        id: UUID;
+        content: string;
+        embedding: number[];
+        metadata: any;
+        embeddingInfo: {
+            embedding_dim: number;
+            embedding_type: string;
+            embedding_version: string;
+            embedding_provider: string;
+            embedding_model: string;
+            embedding_checksum: string;
+        };
+    }): Promise<void> {
+        const { id, content, embedding, metadata, embeddingInfo } = params;
+        await this.runtime.databaseAdapter.db.run(
+            `INSERT OR REPLACE INTO ${this.tableName} (
+                id, content, embedding, metadata, created_at, last_accessed, access_count,
+                embedding_dim, embedding_type, embedding_version, embedding_provider,
+                embedding_model, embedding_checksum
+            ) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), 0, ?, ?, ?, ?, ?, ?)`,
+            [
+                id,
+                content,
+                JSON.stringify(embedding),
+                JSON.stringify(metadata),
+                embeddingInfo.embedding_dim,
+                embeddingInfo.embedding_type,
+                embeddingInfo.embedding_version,
+                embeddingInfo.embedding_provider,
+                embeddingInfo.embedding_model,
+                embeddingInfo.embedding_checksum
+            ]
+        );
+    }
+
+    async getRAGEmbeddings(params: {
+        agentId: UUID;
+        limit?: number;
+    }): Promise<RAGKnowledgeItem[]> {
+        const { agentId, limit = 100 } = params;
+        const rows = await this.runtime.databaseAdapter.db.all(
+            `SELECT * FROM ${this.tableName} WHERE agentId = ? LIMIT ?`,
+            [agentId, limit]
+        );
+        return rows.map(row => ({
+            id: row.id,
+            agentId: row.agentId,
+            content: {
+                text: row.content,
+                metadata: JSON.parse(row.metadata)
+            },
+            embedding: new Float32Array(JSON.parse(row.embedding)),
+            createdAt: new Date(row.created_at).getTime(),
+            similarity: row.similarity,
+            score: row.score
+        }));
+    }
+
+    async searchRAG(params: {
+        agentId: UUID;
+        embedding: number[];
+        match_threshold: number;
+        match_count: number;
+    }): Promise<RAGKnowledgeItem[]> {
+        const { agentId, embedding, match_threshold, match_count } = params;
+        const rows = await this.runtime.databaseAdapter.db.all(
+            `SELECT *, 
+            (SELECT COUNT(*) FROM ${this.tableName} WHERE agentId = ?) as total_count,
+            (SELECT AVG(access_count) FROM ${this.tableName} WHERE agentId = ?) as avg_access_count
+            FROM ${this.tableName} 
+            WHERE agentId = ? 
+            ORDER BY similarity DESC 
+            LIMIT ?`,
+            [agentId, agentId, agentId, match_count]
+        );
+
+        return rows.map(row => ({
+            id: row.id,
+            agentId: row.agentId,
+            content: {
+                text: row.content,
+                metadata: JSON.parse(row.metadata)
+            },
+            embedding: new Float32Array(JSON.parse(row.embedding)),
+            createdAt: new Date(row.created_at).getTime(),
+            similarity: row.similarity,
+            score: row.score
+        }));
+    }
+
+    async checkRAGHealth(): Promise<boolean> {
+        try {
+            const result = await this.runtime.databaseAdapter.db.get(
+                `SELECT COUNT(*) as count FROM ${this.tableName}`
+            );
+            return result.count > 0;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    async repairRAGEntries(): Promise<void> {
+        const rows = await this.runtime.databaseAdapter.db.all(
+            `SELECT * FROM ${this.tableName} WHERE embedding IS NULL OR content IS NULL`
+        );
+
+        for (const row of rows) {
+            if (!row.embedding && row.content) {
+                const embedding = await this.runtime.generateEmbedding(row.content);
+                const embeddingInfo = {
+                    embedding_dim: embedding.length,
+                    embedding_type: 'text',
+                    embedding_version: '1.0',
+                    embedding_provider: this.runtime.embeddingProvider || 'default',
+                    embedding_model: this.runtime.embeddingModel || 'default',
+                    embedding_checksum: await this.generateEmbeddingChecksum(embedding)
+                };
+
+                await this.storeRAGEmbedding({
+                    id: row.id,
+                    content: row.content,
+                    embedding,
+                    metadata: JSON.parse(row.metadata || '{}'),
+                    embeddingInfo
+                });
+            }
+        }
+    }
+
+    private async generateEmbeddingChecksum(embedding: number[]): Promise<string> {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(JSON.stringify(embedding));
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     }
 }
