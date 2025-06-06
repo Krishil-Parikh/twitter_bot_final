@@ -8,6 +8,7 @@ import {
     ModelClass,
     type Evaluator,
 } from "@elizaos/core";
+import { type IAgentRuntimeWithEmbedding } from "@elizaos/core";
 
 export const formatFacts = (facts: Memory[]) => {
     const messageStrings = facts
@@ -51,7 +52,7 @@ Response should be a JSON object array inside a JSON markdown block. Correct res
 ]
 \`\`\``;
 
-async function handler(runtime: IAgentRuntime, message: Memory) {
+async function handler(runtime: IAgentRuntimeWithEmbedding, message: Memory) {
     const state = await runtime.composeState(message);
 
     const { agentId, roomId } = state;

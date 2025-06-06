@@ -180,6 +180,20 @@ export class AgentRuntime implements IAgentRuntime {
 
     // verifiableInferenceAdapter?: IVerifiableInferenceAdapter;
 
+    cache = {
+        async get(key: string): Promise<any> {
+            return this.cacheManager?.get(key);
+        },
+        async set(key: string, value: any): Promise<void> {
+            await this.cacheManager?.set(key, value);
+        }
+    };
+
+    async generateEmbedding(text: string): Promise<number[]> {
+        const { embed } = await import("./embedding.ts");
+        return embed(this, text);
+    }
+
     registerMemoryManager(manager: IMemoryManager): void {
         if (!manager.tableName) {
             throw new Error("Memory manager must have a tableName");

@@ -168,10 +168,10 @@ importers:
         specifier: workspace:*
         version: link:../packages/core
       '@elizaos/plugin-bootstrap':
-        specifier: workspace:*
+        specifier: ^0.25.9
         version: link:../packages/plugin-bootstrap
       '@elizaos/plugin-twitter':
-        specifier: workspace:*
+        specifier: ^1.0.0
         version: link:../packages/plugin-twitter
       '@types/node':
         specifier: ^22.13.5
@@ -660,6 +660,9 @@ importers:
       '@types/node':
         specifier: ^22.13.5
         version: 22.13.5
+      tsup:
+        specifier: 8.3.5
+        version: 8.3.5(@swc/core@1.11.4(@swc/helpers@0.5.15))(jiti@1.21.7)(postcss@8.5.3)(typescript@5.6.3)(yaml@2.7.0)
       typescript:
         specifier: ^5.6.3
         version: 5.6.3

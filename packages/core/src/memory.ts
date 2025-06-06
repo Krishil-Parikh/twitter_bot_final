@@ -1,4 +1,4 @@
-import { embed, getEmbeddingZeroVector } from "./embedding.ts";
+import { embed, getEmbeddingZeroVector, type IAgentRuntimeWithEmbedding } from "./embedding.ts";
 import elizaLogger from "./logger.ts";
 import type {
     IAgentRuntime,
@@ -17,7 +17,7 @@ export class MemoryManager implements IMemoryManager {
     /**
      * The AgentRuntime instance associated with this manager.
      */
-    runtime: IAgentRuntime;
+    runtime: IAgentRuntimeWithEmbedding;
 
     /**
      * The name of the database table this manager operates on.
@@ -30,7 +30,7 @@ export class MemoryManager implements IMemoryManager {
      * @param opts.tableName The name of the table this manager will operate on.
      * @param opts.runtime The AgentRuntime instance associated with this manager.
      */
-    constructor(opts: { tableName: string; runtime: IAgentRuntime }) {
+    constructor(opts: { tableName: string; runtime: IAgentRuntimeWithEmbedding }) {
         this.runtime = opts.runtime;
         this.tableName = opts.tableName;
     }

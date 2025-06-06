@@ -20,14 +20,14 @@
     "dependencies": {
         "@elizaos/client-direct": "workspace:*",
         "@elizaos/core": "workspace:*",
-        "@elizaos/plugin-bootstrap": "workspace:*",
-        "@elizaos/plugin-twitter": "workspace:*",
+        "@elizaos/plugin-bootstrap": "^0.25.9",
+        "@elizaos/plugin-twitter": "^1.0.0",
         "@types/node": "^22.13.5",
+        "agent-twitter-client": "^0.0.18",
         "json5": "2.2.3",
         "ts-node": "^10.9.2",
-        "yargs": "17.7.2",
         "twitter-api-v2": "^1.15.2",
-        "agent-twitter-client": "^0.0.18"
+        "yargs": "17.7.2"
     },
     "devDependencies": {
         "@jest/globals": "^29.7.0",

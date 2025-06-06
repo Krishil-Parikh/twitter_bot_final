@@ -177,7 +177,7 @@ export function getEmbeddingZeroVector(): number[] {
     return Array(embeddingDimension).fill(0);
 }
 
-interface IAgentRuntimeWithEmbedding extends CoreIAgentRuntime {
+export interface IAgentRuntimeWithEmbedding extends CoreIAgentRuntime {
     cache: {
         get(key: string): Promise<any>;
         set(key: string, value: any): Promise<void>;
