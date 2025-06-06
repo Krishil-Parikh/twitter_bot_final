@@ -1040,13 +1040,6 @@ export async function createAgent(
                     return cached.data;
                 }
 
-                // Get recent conversation history first
-                const recentHistory = await database.getConversationHistory(
-                    query.split('conversation:')[1]?.split(' ')[0] || '',
-                    username
-                );
-                elizaLogger.info(`[RAG] Retrieved ${recentHistory.length} recent messages for context`);
-
                 // Perform search with retries
                 let attempts = 0;
                 const maxAttempts = 3;
@@ -1067,39 +1060,11 @@ export async function createAgent(
                             }
                         });
                         
-                        // Combine recent history with similarity results
-                        const combinedResults = [
-                            // Add recent history first for context
-                            ...recentHistory.map(msg => ({
-                                content: msg.content,
-                                metadata: msg.metadata,
-                                similarity: 1.0, // Give recent messages highest priority
-                                isRecent: true
-                            })),
-                            // Add similarity-based results
-                            ...(results || []).map(result => ({
-                                ...result,
-                                isRecent: false
-                            }))
-                        ];
-
-                        // Remove duplicates based on content
-                        const uniqueResults = combinedResults.filter((result, index, self) =>
-                            index === self.findIndex((r) => r.content === result.content)
-                        );
-
-                        // Sort by recency first, then similarity
-                        const sortedResults = uniqueResults.sort((a, b) => {
-                            if (a.isRecent && !b.isRecent) return -1;
-                            if (!a.isRecent && b.isRecent) return 1;
-                            return b.similarity - a.similarity;
-                        }).slice(0, limit);
-
-                        if (sortedResults.length > 0) {
+                        if (results && results.length > 0) {
                             // Cache successful results
-                            ragCache.set(cacheKey, { data: sortedResults, timestamp: Date.now() });
-                            elizaLogger.info(`[RAG] Search successful for user ${username}, found ${sortedResults.length} results (${recentHistory.length} recent, ${results?.length || 0} similar)`);
-                            return sortedResults;
+                            ragCache.set(cacheKey, { data: results, timestamp: Date.now() });
+                            elizaLogger.info(`[RAG] Search successful for user ${username}, found ${results.length} results`);
+                            return results;
                         } else {
                             elizaLogger.warn(`[RAG] No results found for user ${username}`);
                             return [];
@@ -1109,25 +1074,14 @@ export async function createAgent(
                         elizaLogger.error(`[RAG] Search attempt ${attempts} failed: ${error.message}`);
                         if (attempts === maxAttempts) {
                             elizaLogger.error(`[RAG] Search failed after ${maxAttempts} attempts:`, error);
-                            // Return recent history as fallback
-                            return recentHistory;
+                            return [];
                         }
                         await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
                     }
                 }
             } catch (error) {
                 elizaLogger.error(`[RAG] Search error: ${error}`);
-                // Try to get recent history as fallback
-                try {
-                    const recentHistory = await database.getConversationHistory(
-                        query.split('conversation:')[1]?.split(' ')[0] || '',
-                        query.split('from:')[1]?.split(' ')[0] || ''
-                    );
-                    return recentHistory;
-                } catch (fallbackError) {
-                    elizaLogger.error(`[RAG] Fallback to recent history failed: ${fallbackError}`);
-                    return [];
-                }
+                return [];
             }
         },
         store: async (data: { id: string; content: string; metadata: any; embedding: Buffer }) => {

@@ -666,163 +666,113 @@ export class Database {
             }
             elizaLogger.info(`[RAG] Searching for user: ${username}`);
 
-            // First try to get embeddings for the query with detailed logging
-            let queryEmbedding: number[];
-            let retryCount = 0;
-            const MAX_RETRIES = 3;
-
-            while (retryCount < MAX_RETRIES) {
-                try {
-                    elizaLogger.info(`[RAG] Attempting to generate embedding (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-                    queryEmbedding = await this.runtime.generateEmbedding(query);
-                    
-                    if (!queryEmbedding) {
-                        throw new Error('Embedding generation returned null');
-                    }
-                    
-                    if (queryEmbedding.length === 0) {
-                        throw new Error('Embedding generation returned empty array');
-                    }
-
-                    // Validate embedding values
-                    const hasNaN = queryEmbedding.some(val => isNaN(val));
-                    const hasInf = queryEmbedding.some(val => !isFinite(val));
-                    
-                    if (hasNaN || hasInf) {
-                        throw new Error(`Invalid embedding values detected: ${hasNaN ? 'NaN' : ''} ${hasInf ? 'Infinity' : ''}`);
-                    }
-
-                    elizaLogger.info(`[RAG] Successfully generated embedding with dimension: ${queryEmbedding.length}`);
-                    elizaLogger.info(`[RAG] First few values: ${queryEmbedding.slice(0, 5).join(', ')}...`);
-                    break; // Success, exit retry loop
-                } catch (embedError) {
-                    retryCount++;
-                    elizaLogger.error(`[RAG] Embedding generation failed (attempt ${retryCount}/${MAX_RETRIES}): ${embedError.message}`);
-                    
-                    if (retryCount === MAX_RETRIES) {
-                        elizaLogger.error('[RAG] All embedding generation attempts failed');
-                        return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
-                    }
-                    
-                    // Wait before retrying
-                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-                }
+            // Always fetch the last 5 messages from conversation history as supplementary context
+            let recentMessages: Array<{ content: string; metadata: any }> = [];
+            try {
+                const conversationId = query.split('conversation:')[1]?.split(' ')[0] || '';
+                recentMessages = await this.getConversationHistory(conversationId, username);
+                recentMessages = recentMessages.slice(0, 5); // Limit to last 5 messages
+                elizaLogger.info(`[RAG] Retrieved ${recentMessages.length} recent conversation messages for context`);
+            } catch (historyError) {
+                elizaLogger.error(`[RAG] Error retrieving recent conversation history: ${historyError.message}`);
             }
 
-            // Get all embeddings from the database with detailed logging
+            // Generate embedding for the query
+            let queryEmbedding: number[];
+            try {
+                queryEmbedding = await this.runtime.generateEmbedding(query);
+                if (!queryEmbedding || queryEmbedding.length === 0) {
+                    elizaLogger.warn('[RAG] Failed to generate embedding, using recent messages');
+                    return recentMessages;
+                }
+                elizaLogger.info(`[RAG] Generated embedding with ${queryEmbedding.length} dimensions`);
+            } catch (error) {
+                elizaLogger.error(`[RAG] Error generating embedding: ${error.message}`);
+                return recentMessages;
+            }
+
+            // Get embeddings from database
             let results;
             try {
                 elizaLogger.info('[RAG] Querying database for embeddings...');
-                
-                // First check if we have any valid embeddings for this user
-                const countQuery = username ? 
-                    'SELECT COUNT(*) as count FROM rag_embeddings WHERE length(embedding) > 0 AND embedding LIKE "[%" AND json_extract(metadata, "$.username") = ?' :
-                    'SELECT COUNT(*) as count FROM rag_embeddings WHERE length(embedding) > 0 AND embedding LIKE "[%"';
-                
-                const countResult = await this.db.get(countQuery, username ? [username] : []);
-                elizaLogger.info(`[RAG] Total valid embeddings for user ${username}: ${countResult.count}`);
 
-                if (countResult.count === 0) {
-                    elizaLogger.warn(`[RAG] No valid embeddings found for user ${username}, searching all embeddings`);
-                    // If no results for specific user, search all embeddings
-                    results = await this.db.all(`
-                        SELECT id, content, metadata, embedding, embedding_dim
-                        FROM rag_embeddings
-                        WHERE length(embedding) > 0 AND embedding LIKE "[%"
-                        ORDER BY created_at DESC
-                        LIMIT ?
-                    `, [limit * 2]);
-                } else {
-                    // Get embeddings for specific user
-                    results = await this.db.all(`
-                        SELECT id, content, metadata, embedding, embedding_dim
-                        FROM rag_embeddings
-                        WHERE length(embedding) > 0 
-                        AND embedding LIKE "[%"
-                        AND json_extract(metadata, "$.username") = ?
-                        ORDER BY created_at DESC
-                        LIMIT ?
-                    `, [username, limit * 2]);
-                }
-                
+                // Get embeddings for specific user or all embeddings
+                results = await this.db.all(
+                    username
+                        ? `
+                            SELECT id, content, metadata, embedding
+                            FROM rag_embeddings
+                            WHERE length(embedding) > 0 
+                            AND embedding LIKE "[%"
+                            AND json_extract(metadata, "$.username") = ?
+                            ORDER BY created_at DESC
+                            LIMIT ?
+                        `
+                        : `
+                            SELECT id, content, metadata, embedding
+                            FROM rag_embeddings
+                            WHERE length(embedding) > 0 
+                            AND embedding LIKE "[%"
+                            ORDER BY created_at DESC
+                            LIMIT ?
+                        `,
+                    username ? [username, limit * 2] : [limit * 2]
+                );
+
                 elizaLogger.info(`[RAG] Retrieved ${results.length} embeddings from database`);
-                
-                if (results.length === 0) {
-                    elizaLogger.warn('[RAG] No results found after filtering');
-                    return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
-                }
 
-                // Log first result for debugging
-                const firstResult = results[0];
-                elizaLogger.info(`[RAG] First result - ID: ${firstResult.id}, Content length: ${firstResult.content.length}, Embedding length: ${firstResult.embedding.length}`);
-                elizaLogger.info(`[RAG] First result embedding preview: ${firstResult.embedding.substring(0, 100)}...`);
+                if (results.length === 0) {
+                    elizaLogger.warn('[RAG] No results found, using recent messages');
+                    return recentMessages;
+                }
             } catch (dbError) {
-                elizaLogger.error(`[RAG] Database error retrieving embeddings: ${dbError.message}`);
-                elizaLogger.error(`[RAG] SQLite error code: ${dbError.code}`);
-                elizaLogger.error(`[RAG] SQLite error details:`, dbError);
-                throw dbError;
+                elizaLogger.error(`[RAG] Database error: ${dbError.message}`);
+                return recentMessages;
             }
 
-            // Calculate cosine similarity for each result with detailed error handling
+            // Calculate similarity scores
             const scoredResults = results.map(row => {
                 try {
-                    // Validate row data
                     if (!row.embedding || !row.content || !row.metadata) {
-                        elizaLogger.warn(`[RAG] Invalid row data for id ${row.id}: missing required fields`);
                         return null;
                     }
 
-                    // Parse stored embedding from JSON string
-                    let storedEmbedding: number[];
-                    try {
-                        storedEmbedding = JSON.parse(row.embedding);
-                        
-                        if (storedEmbedding.length !== queryEmbedding.length) {
-                            elizaLogger.warn(`[RAG] Dimension mismatch for id ${row.id}: expected ${queryEmbedding.length}, got ${storedEmbedding.length}`);
-                            return null;
-                        }
-                    } catch (vectorError) {
-                        elizaLogger.error(`[RAG] Error parsing embedding for id ${row.id}: ${vectorError.message}`);
-                        elizaLogger.error(`[RAG] Raw embedding data: ${row.embedding.substring(0, 100)}...`);
+                    const storedEmbedding = JSON.parse(row.embedding);
+                    if (storedEmbedding.length !== queryEmbedding.length) {
+                        elizaLogger.warn(`[RAG] Dimension mismatch: expected ${queryEmbedding.length}, got ${storedEmbedding.length}`);
                         return null;
                     }
-                    
+
                     // Calculate cosine similarity
                     let dotProduct = 0;
                     let queryMagnitude = 0;
                     let storedMagnitude = 0;
-                    
+
                     for (let i = 0; i < queryEmbedding.length; i++) {
                         dotProduct += queryEmbedding[i] * storedEmbedding[i];
                         queryMagnitude += queryEmbedding[i] * queryEmbedding[i];
                         storedMagnitude += storedEmbedding[i] * storedEmbedding[i];
                     }
-                    
+
                     const similarity = dotProduct / (Math.sqrt(queryMagnitude) * Math.sqrt(storedMagnitude));
-                    
-                    // Parse metadata with error handling
-                    let parsedMetadata;
-                    try {
-                        parsedMetadata = JSON.parse(row.metadata);
-                    } catch (parseError) {
-                        elizaLogger.error(`[RAG] Error parsing metadata for id ${row.id}: ${parseError.message}`);
-                        parsedMetadata = {};
+                    if (isNaN(similarity) || !isFinite(similarity)) {
+                        return null;
                     }
-                    
+
                     return {
                         content: row.content,
-                        metadata: parsedMetadata,
+                        metadata: JSON.parse(row.metadata),
                         similarity
                     };
                 } catch (error) {
-                    elizaLogger.error(`[RAG] Error processing embedding for ${row.id}: ${error.message}`);
+                    elizaLogger.error(`[RAG] Error processing result: ${error.message}`);
                     return null;
                 }
             }).filter(Boolean);
 
             if (scoredResults.length === 0) {
-                elizaLogger.warn('[RAG] No valid results after similarity calculation');
-                return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+                elizaLogger.warn('[RAG] No valid results after similarity calculation, using recent messages');
+                return recentMessages;
             }
 
             // Sort by similarity and take top results
@@ -831,13 +781,27 @@ export class Database {
                 .slice(0, limit)
                 .map(({ content, metadata }) => ({ content, metadata }));
 
-            elizaLogger.info(`[RAG] Returning ${sortedResults.length} results with similarity scores`);
-            return sortedResults;
+            // Combine RAG results with recent messages
+            const combinedResults = [...sortedResults];
+            const existingIds = new Set(sortedResults.map(r => r.metadata?.tweetId));
+            for (const msg of recentMessages) {
+                if (!existingIds.has(msg.metadata?.tweetId)) {
+                    combinedResults.push(msg);
+                    existingIds.add(msg.metadata?.tweetId);
+                }
+            }
+
+            // Limit to requested number of results
+            const finalResults = combinedResults.slice(0, limit);
+
+            elizaLogger.info(`[RAG] Returning ${finalResults.length} results: ${sortedResults.length} from RAG, ${recentMessages.length} from conversation history`);
+            return finalResults;
 
         } catch (error) {
-            elizaLogger.error(`[RAG] Error in searchRAG: ${error.message}`, error);
-            // Fallback to conversation history on error
-            return await this.getConversationHistory(query.split('conversation:')[1]?.split(' ')[0] || '', username);
+            elizaLogger.error(`[RAG] Error in searchRAG: ${error.message}`);
+            const conversationId = query.split('conversation:')[1]?.split(' ')[0] || '';
+            const fallbackResults = await this.getConversationHistory(conversationId, username);
+            return fallbackResults.slice(0, limit);
         }
     }
 }
